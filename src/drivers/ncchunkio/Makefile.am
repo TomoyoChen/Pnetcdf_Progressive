@@ -6,12 +6,19 @@
 #
 # @configure_input@
 
+libncchkio_la_SOURCES =
+
 SUFFIXES = .a .o .c .m4 .h
 
 AM_CPPFLAGS  = -I${top_srcdir}/src/include
 AM_CPPFLAGS += -I${top_builddir}/src/include
 AM_CPPFLAGS += -I${top_srcdir}/src/drivers/include
 AM_CPPFLAGS += -I${top_builddir}/src/drivers/include
+
+if ENABLE_IPCOMP
+   AM_CPPFLAGS += @IPCOMP_CFLAGS@
+   AM_CXXFLAGS = -std=c++17 @IPCOMP_CFLAGS@
+endif
 
 if PNETCDF_DEBUG
    AM_CPPFLAGS += -DPNETCDF_DEBUG
@@ -71,6 +78,12 @@ endif
 
 if ENABLE_SZ
    C_SRCS += ncchk_filter_sz.c
+endif
+
+if ENABLE_IPCOMP
+   C_SRCS += ncchk_filter_ipcomp.c
+   CXX_SRCS = ipcomp_wrapper.cpp
+   libncchkio_la_SOURCES = $(CXX_SRCS)
 endif
 
 $(M4_SRCS:.m4=.c): Makefile

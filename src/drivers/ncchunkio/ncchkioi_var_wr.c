@@ -20,6 +20,7 @@
 #include <common.h>
 #include <math.h>
 #include <mpi.h>
+#include <float.h>
 #include <ncchkio_driver.h>
 #include <pnc_debug.h>
 #include <stdio.h>
@@ -80,11 +81,66 @@ int ncchkioi_save_var (NC_chk *ncchkp, NC_chk_var *varp) {
 			k = varp->mychunks[l];
 
 			if (varp->dirty[k]) {
+				// Prepare variable context for compression
+				NCCHK_var_context ctx = (NCCHK_var_context){0};
+				ctx.sz_abs_err_bound = varp->sz_abs_err_bound;
+				ctx.sz_rel_bound_ratio = varp->sz_rel_bound_ratio;
+				ctx.zlib_level = varp->zlib_level;
+				ctx.varid = varp->varid;
+#ifdef ENABLE_IPCOMP
+				ctx.ipcomp_layers = varp->ipcomp_layers;
+				ctx.ipcomp_interp = varp->ipcomp_interp;
+				ctx.ipcomp_direction = varp->ipcomp_direction;
+				ctx.ipcomp_level_progressive = varp->ipcomp_level_progressive;
+				ctx.ipcomp_block_size = varp->ipcomp_block_size;
+				ctx.ipcomp_ebs = varp->ipcomp_ebs;
+				ctx.ipcomp_num_ebs = varp->ipcomp_num_ebs;
+				ctx.ipcomp_data_range = varp->ipcomp_data_range;
+				ctx.ipcomp_data_min = varp->ipcomp_data_min;
+				ctx.ipcomp_data_max = varp->ipcomp_data_max;
+				ctx.ipcomp_has_minmax = varp->ipcomp_has_minmax;
+				if (varp->filter == NC_CHK_FILTER_IPCOMP) {
+					const double *bufd = (varp->etype == MPI_DOUBLE)
+											 ? (const double *)varp->chunk_cache[k]->buf
+											 : NULL;
+					const float *buff = (varp->etype == MPI_FLOAT)
+											 ? (const float *)varp->chunk_cache[k]->buf
+											 : NULL;
+					double rmin = DBL_MAX, rmax = -DBL_MAX;
+					size_t elem_cnt = (size_t)varp->chunksize / (size_t)varp->esize;
+					if (buff != NULL) {
+						for (size_t ei = 0; ei < elem_cnt; ei++) {
+							double v = (double)buff[ei];
+							if (v < rmin) { rmin = v; }
+							if (v > rmax) { rmax = v; }
+						}
+					} else if (bufd != NULL) {
+						for (size_t ei = 0; ei < elem_cnt; ei++) {
+							double v = bufd[ei];
+							if (v < rmin) { rmin = v; }
+							if (v > rmax) { rmax = v; }
+						}
+					}
+					if (rmin != DBL_MAX && rmax != -DBL_MAX) {
+						double c_range = rmax - rmin;
+						if (c_range > 0.0) { ctx.ipcomp_data_range = c_range; }
+					}
+				}
+#endif
+
 				// Apply compression
 				err = varp->filter_driver->compress_alloc (varp->chunk_cache[k]->buf, varp->chunksize,
 												 zbufs + l, zsizes + k, varp->ndim, varp->chunkdim,
-												 varp->etype);
+												 varp->etype, &ctx);
 				CHK_ERR
+#ifdef ENABLE_IPCOMP
+				if (varp->filter == NC_CHK_FILTER_IPCOMP &&
+					ctx.ipcomp_header_size > 0 &&
+					(varp->ipcomp_header_size == 0 ||
+					 varp->ipcomp_header_size != ctx.ipcomp_header_size)) {
+					varp->ipcomp_header_size = ctx.ipcomp_header_size;
+				}
+#endif
 			}
 		}
 		varp->filter_driver->finalize ();
@@ -381,10 +437,57 @@ int ncchkioi_save_nvar (NC_chk *ncchkp, int nvar, int *varids) {
 
 				// Apply compression
 				if (varp->dirty[cid]) {
+					// Prepare variable context for compression
+					NCCHK_var_context ctx = (NCCHK_var_context){0};
+					ctx.sz_abs_err_bound = varp->sz_abs_err_bound;
+					ctx.sz_rel_bound_ratio = varp->sz_rel_bound_ratio;
+					ctx.zlib_level = varp->zlib_level;
+					ctx.varid = varp->varid;
+#ifdef ENABLE_IPCOMP
+					ctx.ipcomp_layers = varp->ipcomp_layers;
+					ctx.ipcomp_interp = varp->ipcomp_interp;
+					ctx.ipcomp_direction = varp->ipcomp_direction;
+					ctx.ipcomp_level_progressive = varp->ipcomp_level_progressive;
+					ctx.ipcomp_block_size = varp->ipcomp_block_size;
+					ctx.ipcomp_ebs = varp->ipcomp_ebs;
+					ctx.ipcomp_num_ebs = varp->ipcomp_num_ebs;
+					ctx.ipcomp_data_range = varp->ipcomp_data_range;
+					ctx.ipcomp_has_fill = varp->ipcomp_has_fill;
+					ctx.ipcomp_fill_value = varp->ipcomp_fill_value;
+					ctx.ipcomp_header_size = varp->ipcomp_header_size;
+					if (varp->filter == NC_CHK_FILTER_IPCOMP) {
+						const double *bufd = (varp->etype == MPI_DOUBLE)
+												 ? (const double *)varp->chunk_cache[cid]->buf
+												 : NULL;
+						const float *buff = (varp->etype == MPI_FLOAT)
+												 ? (const float *)varp->chunk_cache[cid]->buf
+												 : NULL;
+						double rmin = DBL_MAX, rmax = -DBL_MAX;
+						size_t elem_cnt = (size_t)varp->chunksize / (size_t)varp->esize;
+						if (buff != NULL) {
+							for (size_t ei = 0; ei < elem_cnt; ei++) {
+								double v = (double)buff[ei];
+								if (v < rmin) { rmin = v; }
+								if (v > rmax) { rmax = v; }
+							}
+						} else if (bufd != NULL) {
+							for (size_t ei = 0; ei < elem_cnt; ei++) {
+								double v = bufd[ei];
+								if (v < rmin) { rmin = v; }
+								if (v > rmax) { rmax = v; }
+							}
+						}
+						if (rmin != DBL_MAX && rmax != -DBL_MAX) {
+							double c_range = rmax - rmin;
+							if (c_range > 0.0) { ctx.ipcomp_data_range = c_range; }
+						}
+					}
+#endif
+
 					zdels[ccur] = 1;
 					err = varp->filter_driver->compress_alloc (varp->chunk_cache[cid]->buf, varp->chunksize,
 													 zbufs + (ccur++), zsizesp + cid, varp->ndim,
-													 varp->chunkdim, varp->etype);
+													 varp->chunkdim, varp->etype, &ctx);
 					CHK_ERR
 				}
 			}
@@ -510,6 +613,29 @@ int ncchkioi_save_nvar (NC_chk *ncchkp, int nvar, int *varids) {
 				// lens[wcur] = varp->nchunk * sizeof(int);
 				// fdisps[wcur] = (MPI_Aint)(varp->metaoff + ncp->begin_var + sizeof(long long) *
 				// varp->nchunkalloc); mdisps[wcur++] = (MPI_Aint)(varp->data_lens);
+			}
+
+			if (varp->filter == NC_CHK_FILTER_IPCOMP &&
+				ncchkp->rank == varp->chunk_owner[0] &&
+				varp->ipcomp_data_range > 0.0) {
+				double range_attr = varp->ipcomp_data_range;
+				err = ncchkp->driver->put_att (ncchkp->ncp, varp->varid, "comp:data_range",
+											   NC_DOUBLE, 1, &range_attr, MPI_DOUBLE);
+				if (err != NC_NOERR) return err;
+				if (varp->ipcomp_has_minmax) {
+					err = ncchkp->driver->put_att (ncchkp->ncp, varp->varid, "comp:data_min",
+												   NC_DOUBLE, 1, &varp->ipcomp_data_min, MPI_DOUBLE);
+					if (err != NC_NOERR) return err;
+					err = ncchkp->driver->put_att (ncchkp->ncp, varp->varid, "comp:data_max",
+												   NC_DOUBLE, 1, &varp->ipcomp_data_max, MPI_DOUBLE);
+					if (err != NC_NOERR) return err;
+				}
+				if (varp->ipcomp_header_size > 0) {
+					unsigned long long header_bytes = (unsigned long long)varp->ipcomp_header_size;
+					err = ncchkp->driver->put_att (ncchkp->ncp, varp->varid, "comp:header_size",
+												   NC_UINT64, 1, &header_bytes, MPI_UNSIGNED_LONG_LONG);
+					if (err != NC_NOERR) return err;
+				}
 			}
 		}
 

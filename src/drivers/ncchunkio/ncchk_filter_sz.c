@@ -56,22 +56,7 @@ static int mpi_to_sz_type(MPI_Datatype dtype){
 }
 
 int ncchk_sz_init(MPI_Info info) {
-    sz_params sz;
-
-    memset(&sz, 0, sizeof(sz_params));
-    sz.sol_ID = SZ;
-    sz.sampleDistance = 50;
-    sz.quantization_intervals = 0;
-    sz.max_quant_intervals = 65536;
-    sz.predThreshold = 0.98;
-    sz.szMode = SZ_BEST_COMPRESSION;
-    sz.losslessCompressor = ZSTD_COMPRESSOR;
-    sz.gzipMode = 1;
-    sz.errorBoundMode = ABS;
-    sz.absErrBound = 1E-3;
-    sz.relBoundRatio = 1E-5;
-    SZ_Init_Params(&sz);
-
+    /* SZ will be initialized per-variable with specific parameters */
     return NC_NOERR;
 }
 
@@ -84,26 +69,51 @@ int ncchk_sz_finalize() {
 /* Return an estimated compressed data size
  * Actual compressed size should not exceed the estimation
  */
-int ncchk_sz_inq_cpsize(void *in, int in_len, int *out_len, int ndim, int *dims, MPI_Datatype dtype) {
+int ncchk_sz_inq_cpsize(void *in, int in_len, int *out_len, int ndim, int *dims, MPI_Datatype dtype, NCCHK_var_context* ctx) {
     return NC_ENOTSUPPORT;  // sz has no size estimation
 }
 
 /* If out_len is large enough, compress the data at in and save it to out. out_len is set to actual compressed data size
  * If out_len is NULL, we assume out is large enough for compressed data
  */
-int ncchk_sz_compress(void *in, int in_len, void *out, int *out_len, int ndim, int *dims, MPI_Datatype dtype) {
+int ncchk_sz_compress(void *in, int in_len, void *out, int *out_len, int ndim, int *dims, MPI_Datatype dtype, NCCHK_var_context* ctx) {
     int err=NC_NOERR;
     int i;
     int szdtype;
     size_t r[4];
     size_t outsize;
     void *buf = NULL;
+    sz_params sz;
 
     szdtype = mpi_to_sz_type(dtype);
     if (szdtype < 0){
         DEBUG_ASSIGN_ERROR(err, NC_EINVAL)
         goto out;
     }
+
+    /* Initialize SZ with variable-specific parameters */
+    memset(&sz, 0, sizeof(sz_params));
+    sz.sol_ID = SZ;
+    sz.sampleDistance = 50;
+    sz.quantization_intervals = 0;
+    sz.max_quant_intervals = 65536;
+    sz.predThreshold = 0.98;
+    sz.szMode = SZ_BEST_COMPRESSION;
+    sz.losslessCompressor = ZSTD_COMPRESSOR;
+    sz.gzipMode = 1;
+    sz.errorBoundMode = ABS;
+    
+    /* Use variable-specific parameters if provided */
+    if (ctx != NULL) {
+        sz.absErrBound = ctx->sz_abs_err_bound;
+        sz.relBoundRatio = ctx->sz_rel_bound_ratio;
+    } else {
+        /* Default values */
+        sz.absErrBound = 1E-3;
+        sz.relBoundRatio = 1E-5;
+    }
+    
+    SZ_Init_Params(&sz);
 
     for(i = 0; i < 4; i++){
         if (i < ndim){
@@ -144,19 +154,44 @@ out:
  * The caller is responsible to free the buffer
  * If out_len is not NULL, it will be set to buffer size allocated
  */
-int ncchk_sz_compress_alloc(void *in, int in_len, void **out, int *out_len, int ndim, int *dims, MPI_Datatype dtype) {
+int ncchk_sz_compress_alloc(void *in, int in_len, void **out, int *out_len, int ndim, int *dims, MPI_Datatype dtype, NCCHK_var_context* ctx) {
     int err=NC_NOERR;
     int i;
     int szdtype;
     size_t r[4];
     size_t outsize;
     void *buf = NULL;
+    sz_params sz;
 
     szdtype = mpi_to_sz_type(dtype);
     if (szdtype < 0){
         DEBUG_ASSIGN_ERROR(err, NC_EINVAL)
         goto out;
     }
+
+    /* Initialize SZ with variable-specific parameters */
+    memset(&sz, 0, sizeof(sz_params));
+    sz.sol_ID = SZ;
+    sz.sampleDistance = 50;
+    sz.quantization_intervals = 0;
+    sz.max_quant_intervals = 65536;
+    sz.predThreshold = 0.98;
+    sz.szMode = SZ_BEST_COMPRESSION;
+    sz.losslessCompressor = ZSTD_COMPRESSOR;
+    sz.gzipMode = 1;
+    sz.errorBoundMode = ABS;
+    
+    /* Use variable-specific parameters if provided */
+    if (ctx != NULL) {
+        sz.absErrBound = ctx->sz_abs_err_bound;
+        sz.relBoundRatio = ctx->sz_rel_bound_ratio;
+    } else {
+        /* Default values */
+        sz.absErrBound = 1E-3;
+        sz.relBoundRatio = 1E-5;
+    }
+    
+    SZ_Init_Params(&sz);
 
     for(i = 0; i < 4; i++){
         if (i < ndim){
@@ -188,14 +223,14 @@ out:
 /* Return an estimated decompressed data size
  * Actual decompressed size should not exceed the estimation
  */
-int ncchk_sz_inq_dcsize(void *in, int in_len, int *out_len, int ndim, int *dims, MPI_Datatype dtype) {
+int ncchk_sz_inq_dcsize(void *in, int in_len, int *out_len, int ndim, int *dims, MPI_Datatype dtype, NCCHK_var_context* ctx) {
     return NC_ENOTSUPPORT;  // sz has no size estimation
 }
 
 /* If out_len is large enough, decompress the data at in and save it to out. out_len is set to actual decompressed size
  * If out_len is NULL, we assume out is large enough for decompressed data
  */
-int ncchk_sz_decompress(void *in, int in_len, void *out, int *out_len, int ndim, int *dims, MPI_Datatype dtype) {
+int ncchk_sz_decompress(void *in, int in_len, void *out, int *out_len, int ndim, int *dims, MPI_Datatype dtype, NCCHK_var_context* ctx) {
     int err=NC_NOERR;
     int i;
     size_t r[4];
@@ -251,7 +286,7 @@ out:
  * The caller is responsible to free the buffer
  * If out_len is not NULL, it will be set to buffer size allocated
  */
-int ncchk_sz_decompress_alloc(void *in, int in_len, void **out, int *out_len, int ndim, int *dims, MPI_Datatype dtype) {
+int ncchk_sz_decompress_alloc(void *in, int in_len, void **out, int *out_len, int ndim, int *dims, MPI_Datatype dtype, NCCHK_var_context* ctx) {
     int err=NC_NOERR;
     int i;
     size_t r[4];

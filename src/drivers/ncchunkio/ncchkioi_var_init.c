@@ -158,6 +158,37 @@ int ncchkioi_var_init_core (
 			} else {
 				varp->filter = ncchkp->default_filter;
 			}
+
+			/* Initialize compression parameters with defaults ONLY if not already set */
+			/* Read variable-specific SZ parameters if available, otherwise use defaults */
+			ret = ncchkp->driver->inq_att (ncchkp->ncp, varp->varid, "_sz_abs_err_bound", NULL, &len);
+			if (ret == NC_NOERR && len == 1) {
+				ret = ncchkp->driver->get_att (ncchkp->ncp, varp->varid, "_sz_abs_err_bound",
+											   &(varp->sz_abs_err_bound), MPI_DOUBLE);
+			} else {
+				varp->sz_abs_err_bound = 1E-3;  /* Default only if attribute not found */
+			}
+
+			ret = ncchkp->driver->inq_att (ncchkp->ncp, varp->varid, "_sz_rel_bound_ratio", NULL, &len);
+			if (ret == NC_NOERR && len == 1) {
+				ret = ncchkp->driver->get_att (ncchkp->ncp, varp->varid, "_sz_rel_bound_ratio",
+											   &(varp->sz_rel_bound_ratio), MPI_DOUBLE);
+			} else {
+				varp->sz_rel_bound_ratio = 1E-3;  /* Default only if attribute not found */
+			}
+
+			/* Read variable-specific ZLIB parameters if available, otherwise use defaults */
+			ret = ncchkp->driver->inq_att (ncchkp->ncp, varp->varid, "_zlib_level", NULL, &len);
+			if (ret == NC_NOERR && len == 1) {
+				ret = ncchkp->driver->get_att (ncchkp->ncp, varp->varid, "_zlib_level",
+											   &(varp->zlib_level), MPI_INT);
+				/* Ensure valid range [1-9] */
+				if (varp->zlib_level < 1 || varp->zlib_level > 9) {
+					varp->zlib_level = 6;  /* Reset to default if invalid */
+				}
+			} else {
+				varp->zlib_level = 6;  /* Default ZLIB compression level only if attribute not found */
+			}
 			switch (varp->filter) {
 				case NC_CHK_FILTER_NONE:
 					varp->filter_driver = NULL;
@@ -169,6 +200,151 @@ int ncchkioi_var_init_core (
 				case NC_CHK_FILTER_ZLIB:
 					varp->filter_driver = ncchk_zlib_inq_driver ();
 					break;
+#endif
+#ifdef ENABLE_IPCOMP
+				case NC_CHK_FILTER_IPCOMP: {
+					MPI_Offset attr_len = 0;
+					int attr_int = 0;
+
+					varp->filter_driver = ncchk_ipcomp_inq_driver ();
+
+					varp->ipcomp_layers = 1;
+					varp->ipcomp_interp = 1;
+					varp->ipcomp_direction = 0;
+					varp->ipcomp_level_progressive = 0;
+					varp->ipcomp_block_size = IPCOMP_DEFAULT_BLOCK_SIZE;
+					varp->ipcomp_data_range = 0.0;
+					if (varp->ipcomp_ebs != NULL) {
+						NCI_Free (varp->ipcomp_ebs);
+						varp->ipcomp_ebs = NULL;
+					}
+					varp->ipcomp_num_ebs = 0;
+
+					ret = ncchkp->driver->inq_att (ncchkp->ncp, varp->varid, "comp:layers", NULL, &attr_len);
+					if (ret == NC_NOERR && attr_len == 1) {
+						ret = ncchkp->driver->get_att (ncchkp->ncp, varp->varid, "comp:layers", &attr_int, MPI_INT);
+						if (ret == NC_NOERR && attr_int > 0) { varp->ipcomp_layers = attr_int; }
+					}
+
+					ret = ncchkp->driver->inq_att (ncchkp->ncp, varp->varid, "comp:level_progressive", NULL, &attr_len);
+					if (ret == NC_NOERR && attr_len == 1) {
+						ret = ncchkp->driver->get_att (ncchkp->ncp, varp->varid, "comp:level_progressive", &attr_int, MPI_INT);
+						if (ret == NC_NOERR && attr_int >= 0) { varp->ipcomp_level_progressive = attr_int; }
+					}
+
+					ret = ncchkp->driver->inq_att (ncchkp->ncp, varp->varid, "comp:block_size", NULL, &attr_len);
+					if (ret == NC_NOERR && attr_len == 1) {
+						ret = ncchkp->driver->get_att (ncchkp->ncp, varp->varid, "comp:block_size", &attr_int, MPI_INT);
+						if (ret == NC_NOERR && attr_int > 0) {
+							varp->ipcomp_block_size = (size_t)attr_int;
+						}
+					}
+
+					ret = ncchkp->driver->inq_att (ncchkp->ncp, varp->varid, "comp:data_range", NULL, &attr_len);
+					if (ret == NC_NOERR && attr_len == 1) {
+						double range_val = 0.0;
+						ret = ncchkp->driver->get_att (ncchkp->ncp, varp->varid, "comp:data_range", &range_val, MPI_DOUBLE);
+						if (ret == NC_NOERR && range_val > 0.0) { varp->ipcomp_data_range = range_val; }
+					}
+
+					varp->ipcomp_has_minmax = 0;
+					double min_val = 0.0;
+					double max_val = 0.0;
+					ret = ncchkp->driver->inq_att (ncchkp->ncp, varp->varid, "comp:data_min", NULL, &attr_len);
+					if (ret == NC_NOERR && attr_len == 1) {
+						if (ncchkp->driver->get_att (ncchkp->ncp, varp->varid, "comp:data_min", &min_val, MPI_DOUBLE) == NC_NOERR) {
+							ret = ncchkp->driver->inq_att (ncchkp->ncp, varp->varid, "comp:data_max", NULL, &attr_len);
+							if (ret == NC_NOERR && attr_len == 1 &&
+								ncchkp->driver->get_att (ncchkp->ncp, varp->varid, "comp:data_max", &max_val, MPI_DOUBLE) == NC_NOERR &&
+								max_val >= min_val) {
+								varp->ipcomp_data_min = min_val;
+								varp->ipcomp_data_max = max_val;
+								varp->ipcomp_has_minmax = 1;
+							}
+						}
+					}
+
+					ret = ncchkp->driver->inq_att (ncchkp->ncp, varp->varid, "comp:interp", NULL, &attr_len);
+					if (ret == NC_NOERR && attr_len > 0) {
+						char *interp_attr = (char *)NCI_Malloc ((size_t)attr_len + 1);
+						if (interp_attr != NULL) {
+							ret = ncchkp->driver->get_att (ncchkp->ncp, varp->varid, "comp:interp", interp_attr, MPI_CHAR);
+							if (ret == NC_NOERR) {
+								for (MPI_Offset idx = 0; idx < attr_len; idx++) {
+									if (interp_attr[idx] >= 'A' && interp_attr[idx] <= 'Z') {
+										interp_attr[idx] = (char)(interp_attr[idx] - 'A' + 'a');
+									}
+								}
+								interp_attr[attr_len] = '\0';
+								if (strncmp (interp_attr, "linear", (size_t)attr_len) == 0) {
+									varp->ipcomp_interp = 0;
+								} else if (strncmp (interp_attr, "cubic", (size_t)attr_len) == 0) {
+									varp->ipcomp_interp = 1;
+								}
+							}
+							NCI_Free (interp_attr);
+						}
+					}
+
+					ret = ncchkp->driver->inq_att (ncchkp->ncp, varp->varid, "comp:ebs", NULL, &attr_len);
+					if (ret == NC_NOERR && attr_len > 0) {
+						double *ebs_vals = (double *)NCI_Malloc ((size_t)attr_len * sizeof (double));
+						if (ebs_vals != NULL) {
+							ret = ncchkp->driver->get_att (ncchkp->ncp, varp->varid, "comp:ebs", ebs_vals, MPI_DOUBLE);
+							if (ret == NC_NOERR) {
+								if (varp->ipcomp_ebs != NULL) {
+									NCI_Free (varp->ipcomp_ebs);
+									varp->ipcomp_ebs = NULL;
+								}
+								varp->ipcomp_ebs = ebs_vals;
+								varp->ipcomp_num_ebs = (int)attr_len;
+							} else {
+								NCI_Free (ebs_vals);
+							}
+						}
+					}
+
+					/* Capture _FillValue attribute (or fall back to defaults) */
+					if (varp->etype == MPI_FLOAT || varp->etype == MPI_DOUBLE) {
+						if (!varp->ipcomp_has_fill) {
+							varp->ipcomp_has_fill = 1;
+							varp->ipcomp_fill_value =
+								(varp->etype == MPI_FLOAT) ? (double)NC_FILL_FLOAT : NC_FILL_DOUBLE;
+						}
+						MPI_Offset fill_len = 0;
+						int fill_ret = ncchkp->driver->inq_att (ncchkp->ncp, varp->varid,
+															   "_FillValue", NULL, &fill_len);
+						if (fill_ret == NC_NOERR && fill_len == 1) {
+							if (varp->etype == MPI_FLOAT) {
+								float fill_val_f = 0.0f;
+								if (ncchkp->driver->get_att (ncchkp->ncp, varp->varid,
+															 "_FillValue", &fill_val_f, MPI_FLOAT) == NC_NOERR) {
+									varp->ipcomp_fill_value = (double)fill_val_f;
+									varp->ipcomp_has_fill = 1;
+								}
+							} else {
+								double fill_val_d = 0.0;
+								if (ncchkp->driver->get_att (ncchkp->ncp, varp->varid,
+															 "_FillValue", &fill_val_d, MPI_DOUBLE) == NC_NOERR) {
+									varp->ipcomp_fill_value = fill_val_d;
+									varp->ipcomp_has_fill = 1;
+								}
+							}
+						}
+					}
+
+					/* Optional sparse header size hint */
+					ret = ncchkp->driver->inq_att (ncchkp->ncp, varp->varid, "comp:header_size", NULL, &attr_len);
+					if (ret == NC_NOERR && attr_len == 1) {
+						unsigned long long header_bytes = 0ULL;
+						ret = ncchkp->driver->get_att (ncchkp->ncp, varp->varid, "comp:header_size",
+														&header_bytes, MPI_UNSIGNED_LONG_LONG);
+						if (ret == NC_NOERR) {
+							varp->ipcomp_header_size = (size_t)header_bytes;
+						}
+					}
+					break;
+				}
 #endif
 #ifdef ENABLE_SZ
 				case NC_CHK_FILTER_SZ:
@@ -235,6 +411,12 @@ void ncchkioi_var_free (NC_chk_var *varp) {
 		//}
 		NCI_Free (varp->chunk_cache);
 		NCI_Free (varp->mychunks);
+	}
+
+	if (varp->ipcomp_ebs != NULL) {
+		NCI_Free (varp->ipcomp_ebs);
+		varp->ipcomp_ebs = NULL;
+		varp->ipcomp_num_ebs = 0;
 	}
 }
 

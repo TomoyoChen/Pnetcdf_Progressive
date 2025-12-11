@@ -789,9 +789,32 @@ int ncchkio_fill_var_rec (void *ncdp, int varid, MPI_Offset recno) {
 int ncchkio_def_var_fill (void *ncdp, int varid, int no_fill, const void *fill_value) {
 	int err=NC_NOERR;
 	NC_chk *ncchkp = (NC_chk *)ncdp;
+	NC_chk_var *varp = NULL;
+
+	if (varid >= 0 && varid < ncchkp->vars.cnt) {
+		varp = ncchkp->vars.data + varid;
+	}
 
 	err = ncchkp->driver->def_var_fill (ncchkp->ncp, varid, no_fill, fill_value);
 	if (err != NC_NOERR) return err;
+
+#ifdef ENABLE_IPCOMP
+	if (varp != NULL) {
+		if (no_fill) {
+			varp->ipcomp_has_fill = 0;
+		} else if (varp->etype == MPI_FLOAT) {
+			float fv = (fill_value != NULL) ? *((const float *)fill_value) : NC_FILL_FLOAT;
+			varp->ipcomp_fill_value = (double)fv;
+			varp->ipcomp_has_fill = 1;
+		} else if (varp->etype == MPI_DOUBLE) {
+			double fv = (fill_value != NULL) ? *((const double *)fill_value) : NC_FILL_DOUBLE;
+			varp->ipcomp_fill_value = fv;
+			varp->ipcomp_has_fill = 1;
+		} else {
+			varp->ipcomp_has_fill = 0;
+		}
+	}
+#endif
 
 	return NC_NOERR;
 }

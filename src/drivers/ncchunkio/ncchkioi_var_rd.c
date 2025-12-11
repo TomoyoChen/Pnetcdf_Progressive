@@ -28,6 +28,7 @@
 
 #include "../ncmpio/ncmpio_NC.h"
 #include "ncchkio_internal.h"
+#include "ncchk_filter_driver.h"
 
 int ncchkioi_load_var (NC_chk *ncchkp, NC_chk_var *varp, int nchunk, int *cids) {
 	int err=NC_NOERR;
@@ -141,10 +142,49 @@ int ncchkioi_load_var (NC_chk *ncchkp, NC_chk_var *varp, int nchunk, int *cids) 
 				ncchkioi_cache_visit (ncchkp, varp->chunk_cache[cid]);
 			}
 
-			NC_CHK_TIMER_START (NC_CHK_TIMER_GET_IO_DECOM)
+					// Prepare variable context for decompression
+		NCCHK_var_context ctx = (NCCHK_var_context){0};
+		ctx.sz_abs_err_bound = varp->sz_abs_err_bound;
+		ctx.sz_rel_bound_ratio = varp->sz_rel_bound_ratio;
+		ctx.zlib_level = varp->zlib_level;
+		ctx.varid = varp->varid;
+#ifdef ENABLE_IPCOMP
+		ctx.ipcomp_layers = varp->ipcomp_layers;
+		ctx.ipcomp_interp = varp->ipcomp_interp;
+		ctx.ipcomp_direction = varp->ipcomp_direction;
+		ctx.ipcomp_level_progressive = varp->ipcomp_level_progressive;
+		ctx.ipcomp_block_size = varp->ipcomp_block_size;
+		ctx.ipcomp_ebs = varp->ipcomp_ebs;
+		ctx.ipcomp_num_ebs = varp->ipcomp_num_ebs;
+		ctx.ipcomp_data_range = varp->ipcomp_data_range;
+		ctx.ipcomp_data_min = varp->ipcomp_data_min;
+		ctx.ipcomp_data_max = varp->ipcomp_data_max;
+		ctx.ipcomp_has_minmax = varp->ipcomp_has_minmax;
+		ctx.ipcomp_has_fill = varp->ipcomp_has_fill;
+		ctx.ipcomp_fill_value = varp->ipcomp_fill_value;
+		ctx.ipcomp_header_size = varp->ipcomp_header_size;
+#endif
+
+		NC_CHK_TIMER_START (NC_CHK_TIMER_GET_IO_DECOM)
+		
+#ifdef ENABLE_IPCOMP
+		/* Use progressive decompression if target error bound is set */
+		if (varp->filter == NC_CHK_FILTER_IPCOMP && 
+		    varp->ipcomp_use_progressive_decomp && 
+		    varp->ipcomp_target_error_bound > 0.0) {
+			ncchk_ipcomp_decompress_progressive_error(
+				zbufs[i], lens[i], varp->chunk_cache[cid]->buf, &dsize,
+				varp->ndim, varp->chunkdim, varp->etype, 
+				varp->ipcomp_target_error_bound, &ctx);
+		} else {
 			varp->filter_driver->decompress (zbufs[i], lens[i], varp->chunk_cache[cid]->buf, &dsize,
-								   varp->ndim, varp->chunkdim, varp->etype);
-			NC_CHK_TIMER_STOPEX (NC_CHK_TIMER_GET_IO_DECOM, NC_CHK_TIMER_GET_IO_INIT)
+								   varp->ndim, varp->chunkdim, varp->etype, &ctx);
+		}
+#else
+		varp->filter_driver->decompress (zbufs[i], lens[i], varp->chunk_cache[cid]->buf, &dsize,
+							   varp->ndim, varp->chunkdim, varp->etype, &ctx);
+#endif
+		NC_CHK_TIMER_STOPEX (NC_CHK_TIMER_GET_IO_DECOM, NC_CHK_TIMER_GET_IO_INIT)
 
 			if (dsize != varp->chunksize) { printf ("Decompress Error\n"); }
 		}
@@ -305,9 +345,31 @@ int ncchkioi_load_nvar (NC_chk *ncchkp, int nvar, int *varids, int *lo, int *hi)
 
 						// Perform decompression
 						if (varp->chunk_index[cid].len > 0) {
+							// Prepare variable context for decompression
+							NCCHK_var_context ctx = (NCCHK_var_context){0};
+							ctx.sz_abs_err_bound = varp->sz_abs_err_bound;
+							ctx.sz_rel_bound_ratio = varp->sz_rel_bound_ratio;
+							ctx.zlib_level = varp->zlib_level;
+							ctx.varid = varp->varid;
+#ifdef ENABLE_IPCOMP
+							ctx.ipcomp_layers = varp->ipcomp_layers;
+							ctx.ipcomp_interp = varp->ipcomp_interp;
+							ctx.ipcomp_direction = varp->ipcomp_direction;
+							ctx.ipcomp_level_progressive = varp->ipcomp_level_progressive;
+							ctx.ipcomp_block_size = varp->ipcomp_block_size;
+							ctx.ipcomp_ebs = varp->ipcomp_ebs;
+							ctx.ipcomp_num_ebs = varp->ipcomp_num_ebs;
+							ctx.ipcomp_data_range = varp->ipcomp_data_range;
+							ctx.ipcomp_data_min = varp->ipcomp_data_min;
+							ctx.ipcomp_data_max = varp->ipcomp_data_max;
+							ctx.ipcomp_has_minmax = varp->ipcomp_has_minmax;
+							ctx.ipcomp_has_fill = varp->ipcomp_has_fill;
+							ctx.ipcomp_fill_value = varp->ipcomp_fill_value;
+#endif
+
 							NC_CHK_TIMER_START (NC_CHK_TIMER_GET_IO_DECOM)
 							varp->filter_driver->decompress (zbufs[k], lens[k], varp->chunk_cache[cid]->buf,
-												   &dsize, varp->ndim, varp->chunkdim, varp->etype);
+												   &dsize, varp->ndim, varp->chunkdim, varp->etype, &ctx);
 							if (dsize != varp->chunksize) { printf ("Decompress Error\n"); }
 							k++;
 							NC_CHK_TIMER_STOPEX (NC_CHK_TIMER_GET_IO_DECOM,
@@ -506,12 +568,34 @@ int ncchkioi_load_var_bg (NC_chk *ncchkp, NC_chk_var *varp, int nchunk, int *cid
 				// varp->chunk_cache[cid] = (char*)NCI_Malloc(varp->chunksize);
 			} else {
 				ncchkioi_cache_visit (ncchkp, varp->chunk_cache[cid]);
-			}
+					}
 
-			varp->filter_driver->decompress (zbufs[i], lens[i], varp->chunk_cache[cid]->buf, &dsize,
-								   varp->ndim, varp->chunkdim, varp->etype);
+		// Prepare variable context for decompression
+		NCCHK_var_context ctx = (NCCHK_var_context){0};
+		ctx.sz_abs_err_bound = varp->sz_abs_err_bound;
+		ctx.sz_rel_bound_ratio = varp->sz_rel_bound_ratio;
+		ctx.zlib_level = varp->zlib_level;
+		ctx.varid = varp->varid;
+#ifdef ENABLE_IPCOMP
+		ctx.ipcomp_layers = varp->ipcomp_layers;
+		ctx.ipcomp_interp = varp->ipcomp_interp;
+		ctx.ipcomp_direction = varp->ipcomp_direction;
+		ctx.ipcomp_level_progressive = varp->ipcomp_level_progressive;
+		ctx.ipcomp_block_size = varp->ipcomp_block_size;
+		ctx.ipcomp_ebs = varp->ipcomp_ebs;
+		ctx.ipcomp_num_ebs = varp->ipcomp_num_ebs;
+		ctx.ipcomp_data_range = varp->ipcomp_data_range;
+		ctx.ipcomp_data_min = varp->ipcomp_data_min;
+		ctx.ipcomp_data_max = varp->ipcomp_data_max;
+		ctx.ipcomp_has_minmax = varp->ipcomp_has_minmax;
+		ctx.ipcomp_has_fill = varp->ipcomp_has_fill;
+		ctx.ipcomp_fill_value = varp->ipcomp_fill_value;
+#endif
 
-			if (dsize != varp->chunksize) { printf ("Decompress Error\n"); }
+		varp->filter_driver->decompress (zbufs[i], lens[i], varp->chunk_cache[cid]->buf, &dsize,
+							   varp->ndim, varp->chunkdim, varp->etype, &ctx);
+
+		if (dsize != varp->chunksize) { printf ("Decompress Error\n"); }
 		}
 		varp->filter_driver->finalize ();
 	} else {
@@ -669,9 +753,31 @@ int ncchkioi_load_nvar_bg (NC_chk *ncchkp, int nvar, int *varids, int *lo, int *
 
 						// Perform decompression
 						if (varp->chunk_index[cid].len > 0) {
+							// Prepare variable context for decompression
+							NCCHK_var_context ctx = (NCCHK_var_context){0};
+							ctx.sz_abs_err_bound = varp->sz_abs_err_bound;
+							ctx.sz_rel_bound_ratio = varp->sz_rel_bound_ratio;
+							ctx.zlib_level = varp->zlib_level;
+							ctx.varid = varp->varid;
+#ifdef ENABLE_IPCOMP
+							ctx.ipcomp_layers = varp->ipcomp_layers;
+							ctx.ipcomp_interp = varp->ipcomp_interp;
+							ctx.ipcomp_direction = varp->ipcomp_direction;
+							ctx.ipcomp_level_progressive = varp->ipcomp_level_progressive;
+							ctx.ipcomp_block_size = varp->ipcomp_block_size;
+							ctx.ipcomp_ebs = varp->ipcomp_ebs;
+							ctx.ipcomp_num_ebs = varp->ipcomp_num_ebs;
+							ctx.ipcomp_data_range = varp->ipcomp_data_range;
+							ctx.ipcomp_data_min = varp->ipcomp_data_min;
+							ctx.ipcomp_data_max = varp->ipcomp_data_max;
+							ctx.ipcomp_has_minmax = varp->ipcomp_has_minmax;
+							ctx.ipcomp_has_fill = varp->ipcomp_has_fill;
+							ctx.ipcomp_fill_value = varp->ipcomp_fill_value;
+#endif
+
 							NC_CHK_TIMER_START (NC_CHK_TIMER_PUT_BG_DECOM)
 							varp->filter_driver->decompress (zbufs[k], lens[k], varp->chunk_cache[cid]->buf,
-												   &dsize, varp->ndim, varp->chunkdim, varp->etype);
+												   &dsize, varp->ndim, varp->chunkdim, varp->etype, &ctx);
 							if (dsize != varp->chunksize) { printf ("Decompress Error\n"); }
 							k++;
 							NC_CHK_TIMER_STOPEX (NC_CHK_TIMER_PUT_BG_DECOM,

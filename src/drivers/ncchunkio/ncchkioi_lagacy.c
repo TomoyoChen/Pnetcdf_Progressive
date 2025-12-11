@@ -137,7 +137,14 @@ ncchkioi_get_var_old(NC_chk        *ncchkp,
     for(i = 0; i < nb; i++){
         j = bidx[i];
         if (varp->data_lens[j] > 0){
-            varp->filter_driver->decompress(cbuffer + cbsize, varp->data_lens[j], rbuffer + bsize * i, NULL, varp->ndim, varp->dimsize, ncmpii_nc2mpitype(xtype));
+            // Prepare variable context for decompression
+            NCCHK_var_context ctx = (NCCHK_var_context){0};
+            ctx.sz_abs_err_bound = varp->sz_abs_err_bound;
+            ctx.sz_rel_bound_ratio = varp->sz_rel_bound_ratio;
+            ctx.zlib_level = varp->zlib_level;
+            ctx.varid = varp->varid;
+
+            varp->filter_driver->decompress(cbuffer + cbsize, varp->data_lens[j], rbuffer + bsize * i, NULL, varp->ndim, varp->dimsize, ncmpii_nc2mpitype(xtype), &ctx);
         }
         else{
             memset(rbuffer + bsize * i, 0, bsize);
@@ -517,11 +524,18 @@ ncchkioi_put_var_old(NC_chk        *ncchkp,
     memset(zipsize, 0, sizeof(int) * nmychunks);
     memset(zdispls, 0, sizeof(int) * (nmychunks + 1));
 
+    // Prepare variable context for compression
+    NCCHK_var_context ctx = (NCCHK_var_context){0};
+    ctx.sz_abs_err_bound = varp->sz_abs_err_bound;
+    ctx.sz_rel_bound_ratio = varp->sz_rel_bound_ratio;
+    ctx.zlib_level = varp->zlib_level;
+    ctx.varid = varp->varid;
+
     // Calculate compressed data size
     for(i = 0; i < nmychunks; i++){
         // Calculate compressed size
         // This is just estimate
-        varp->filter_driver->compress(xbuf + bsize * i, bsize, NULL, zipsize + i, varp->ndim, varp->chunkdim, etype);
+        varp->filter_driver->compress(xbuf + bsize * i, bsize, NULL, zipsize + i, varp->ndim, varp->chunkdim, etype, &ctx);
     }
 
     // Calculate total size
@@ -536,7 +550,7 @@ ncchkioi_put_var_old(NC_chk        *ncchkp,
     for(i = 0; i < nmychunks; i++){
         // Compressed the data
         // We get real size here
-        varp->filter_driver->compress(xbuf + bsize * i, bsize, zbuf + zdispls[i], zipsize + i, varp->ndim, varp->chunkdim, etype);
+        varp->filter_driver->compress(xbuf + bsize * i, bsize, zbuf + zdispls[i], zipsize + i, varp->ndim, varp->chunkdim, etype, &ctx);
         
         // Calculate offset
         zdispls[i + 1] = zdispls[i] + zipsize[i];

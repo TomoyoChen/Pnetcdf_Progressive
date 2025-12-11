@@ -145,6 +145,10 @@ int ncchkioi_extract_hint (NC_chk *ncchkp, MPI_Info info) {
 			ncchkp->default_filter = NC_CHK_FILTER_ZLIB;
 		} else if (strcmp (value, "sz") == 0) {
 			ncchkp->default_filter = NC_CHK_FILTER_SZ;
+#ifdef ENABLE_IPCOMP
+		} else if (strcmp (value, "ipcomp") == 0) {
+			ncchkp->default_filter = NC_CHK_FILTER_IPCOMP;
+#endif
 		} else {
 			if (ncchkp->rank == 0) { printf ("Warning: Unknown filter %s, use none\n", value); }
 		}
@@ -229,6 +233,11 @@ int ncchkioi_export_hint (NC_chk *ncchkp, MPI_Info info) {
 		case NC_CHK_FILTER_SZ:
 			MPI_Info_set (info, "nc_chk_driver", "sz");
 			break;
+#ifdef ENABLE_IPCOMP
+		case NC_CHK_FILTER_IPCOMP:
+			MPI_Info_set (info, "nc_chk_driver", "ipcomp");
+			break;
+#endif
 	}
 
 	// Buffer size

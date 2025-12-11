@@ -70,6 +70,26 @@ int ncchkio_def_var (
 	*varidp = err;
 
 	varp = ncchkp->vars.data + (*varidp);
+	memset (varp, 0, sizeof (*varp));
+
+#ifdef ENABLE_IPCOMP
+	varp->ipcomp_layers = 1;
+	varp->ipcomp_interp = 1;
+	varp->ipcomp_direction = 0;
+	varp->ipcomp_level_progressive = 0;
+	varp->ipcomp_block_size = IPCOMP_DEFAULT_BLOCK_SIZE;
+	varp->ipcomp_num_ebs = 0;
+	varp->ipcomp_ebs = NULL;
+	varp->ipcomp_data_range = 0.0;
+	varp->ipcomp_data_min = 0.0;
+	varp->ipcomp_data_max = 0.0;
+	varp->ipcomp_has_minmax = 0;
+	varp->ipcomp_has_fill = 0;
+	varp->ipcomp_fill_value = NC_FILL_DOUBLE;
+	varp->ipcomp_header_size = 0;
+	varp->ipcomp_target_error_bound = 0.0;      /* Full precision by default */
+	varp->ipcomp_use_progressive_decomp = 0;   /* Disabled by default */
+#endif
 
 	varp->ndim		  = ndims;
 	varp->chunkdim	  = NULL;
@@ -78,6 +98,17 @@ int ncchkio_def_var (
 	varp->xtype		  = xtype;
 	varp->esize		  = NC_Type_size (xtype);
 	varp->etype		  = ncmpii_nc2mpitype (xtype);
+#ifdef ENABLE_IPCOMP
+	if (varp->etype == MPI_FLOAT) {
+		varp->ipcomp_fill_value = (double)NC_FILL_FLOAT;
+		varp->ipcomp_has_fill = 1;
+	} else if (varp->etype == MPI_DOUBLE) {
+		varp->ipcomp_fill_value = NC_FILL_DOUBLE;
+		varp->ipcomp_has_fill = 1;
+	} else {
+		varp->ipcomp_has_fill = 0;
+	}
+#endif
 	varp->isnew		  = 1;
 	varp->expanded	  = 0;
 
@@ -227,6 +258,15 @@ int ncchkio_get_var (void *ncdp,
 		return ncchkp->driver->get_var (ncchkp->ncp, varp->varid, start, count, stride, imap, buf,
 										bufcount, buftype, reqMode);
 	}
+	
+	/* Check if count contains zero - this process has no data to read but must participate */
+	int has_data = 1;
+	for (int i = 0; i < varp->ndim; i++) {
+		if (count[i] == 0) {
+			has_data = 0;
+			break;
+		}
+	}
 
 	if (ncchkp->delay_init && (varp->chunkdim == NULL)) {
 		NC_CHK_TIMER_PAUSE (NC_CHK_TIMER_GET)
@@ -262,7 +302,7 @@ int ncchkio_get_var (void *ncdp,
 		NC_CHK_TIMER_START (NC_CHK_TIMER_GET)
 	}
 
-	if (varp->isrec && (varp->dimsize[0] < ncchkp->recsize) &&
+	if (has_data && varp->isrec && (varp->dimsize[0] < ncchkp->recsize) &&
 		(start[0] + count[0] >= varp->dimsize[0])) {
 		NC_CHK_TIMER_PAUSE (NC_CHK_TIMER_GET)
 		NC_CHK_TIMER_START (NC_CHK_TIMER_VAR_RESIZE)
@@ -274,7 +314,8 @@ int ncchkio_get_var (void *ncdp,
 		NC_CHK_TIMER_START (NC_CHK_TIMER_GET)
 	}
 
-	if (buftype != varp->etype) {
+	/* Only allocate conversion buffer if we have data to read */
+	if (has_data && buftype != varp->etype) {
 		int i;
 
 		nelem = 1;
@@ -282,11 +323,14 @@ int ncchkio_get_var (void *ncdp,
 
 		xbuf = (char *)NCI_Malloc (nelem * varp->esize);
 		CHK_PTR (xbuf)
-	} else {
+	} else if (has_data) {
 		xbuf = cbuf;
+	} else {
+		/* No data to read, use NULL buffer */
+		xbuf = NULL;
 	}
 
-	// Collective buffer
+	// Collective buffer - all processes must participate
 	switch (ncchkp->comm_unit) {
 		case NC_CHK_COMM_CHUNK:
 			err = ncchkioi_get_var_cb_chunk (ncchkp, varp, start, count, stride, xbuf);
@@ -297,13 +341,13 @@ int ncchkio_get_var (void *ncdp,
 	}
 	CHK_ERR
 
-	if (buftype != varp->etype) {
+	if (has_data && buftype != varp->etype) {
 		err = ncchkioiconvert (xbuf, cbuf, varp->etype, buftype, nelem);
 		if (err != NC_NOERR) return err;
 	}
 
-	if (xbuf != cbuf) NCI_Free (xbuf);
-	if (cbuf != buf) NCI_Free (cbuf);
+	if (has_data && xbuf != cbuf && xbuf != NULL) NCI_Free (xbuf);
+	if (has_data && cbuf != buf && cbuf != NULL) NCI_Free (cbuf);
 
 	NC_CHK_TIMER_STOP (NC_CHK_TIMER_GET)
 	NC_CHK_TIMER_STOP (NC_CHK_TIMER_TOTAL)
@@ -1122,4 +1166,54 @@ int ncchkio_put_vard (void *ncdp,
 	if (err != NC_NOERR) return err;
 
 	return NC_NOERR;
+}
+
+/*
+ * Set target error bound for progressive decompression.
+ * When reading a variable compressed with IPComp, this allows
+ * partial precision reads to reduce data transfer.
+ * 
+ * target_rel_eb: Target relative error bound (0.0 = full precision)
+ */
+int ncchkio_var_set_progressive_error_bound(void *ncdp, int varid, double target_rel_eb) {
+  NC_chk *ncchkp = (NC_chk *)ncdp;
+  NC_chk_var *varp;
+
+  /* Check if ncdp is valid */
+  if (ncchkp == NULL) {
+          return NC_EBADID;
+  }
+
+  /* Check if variable list is initialized */
+  if (ncchkp->vars.data == NULL) {
+          return NC_ENOTVAR;
+  }
+
+  if (varid < 0 || varid >= ncchkp->vars.cnt) {
+          return NC_ENOTVAR;
+  }
+
+  varp = ncchkp->vars.data + varid;
+	
+#ifdef ENABLE_IPCOMP
+	if (varp->filter != NC_CHK_FILTER_IPCOMP) {
+		/* Not an IPComp compressed variable, ignore silently */
+		return NC_NOERR;
+	}
+	
+	varp->ipcomp_target_error_bound = target_rel_eb;
+	varp->ipcomp_use_progressive_decomp = (target_rel_eb > 0.0) ? 1 : 0;
+	
+	return NC_NOERR;
+#else
+	/* IPComp not enabled */
+	return NC_ENOTSUPPORT;
+#endif
+}
+
+/*
+ * Clear progressive decompression settings (restore full precision reads)
+ */
+int ncchkio_var_clear_progressive_error_bound(void *ncdp, int varid) {
+	return ncchkio_var_set_progressive_error_bound(ncdp, varid, 0.0);
 }

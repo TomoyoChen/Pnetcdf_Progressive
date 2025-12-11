@@ -18,6 +18,10 @@
 #include <pnc_debug.h>
 #include <common.h>
 
+#ifdef ENABLE_COMPRESSION
+#include <ncchkio_driver.h>
+#endif
+
 /*----< ncmpi_def_var() >----------------------------------------------------*/
 /* this API is collective, and must be called in define mode */
 int
@@ -272,6 +276,79 @@ int ncmpi_var_get_filter (int         ncid,    /* IN:  file ID */
 {
     return ncmpi_get_att_int(ncid, varid, "_filter", filter);
 }
+
+/*----< ncmpi_var_set_sz_abs_err_bound() >----------------------------------------*/
+/* This is a collective subroutine. */
+int ncmpi_var_set_sz_abs_err_bound(int ncid, int varid, double abs_err)
+{
+    return ncmpi_put_att_double(ncid, varid, "_sz_abs_err_bound", NC_DOUBLE, 1, &abs_err);
+}
+
+/*----< ncmpi_var_get_sz_abs_err_bound() >----------------------------------------*/
+int ncmpi_var_get_sz_abs_err_bound(int ncid, int varid, double *abs_err)
+{
+    return ncmpi_get_att_double(ncid, varid, "_sz_abs_err_bound", abs_err);
+}
+
+/*----< ncmpi_var_set_sz_rel_bound_ratio() >--------------------------------------*/
+/* This is a collective subroutine. */
+int ncmpi_var_set_sz_rel_bound_ratio(int ncid, int varid, double rel_ratio)
+{
+    return ncmpi_put_att_double(ncid, varid, "_sz_rel_bound_ratio", NC_DOUBLE, 1, &rel_ratio);
+}
+
+/*----< ncmpi_var_get_sz_rel_bound_ratio() >--------------------------------------*/
+int ncmpi_var_get_sz_rel_bound_ratio(int ncid, int varid, double *rel_ratio)
+{
+    return ncmpi_get_att_double(ncid, varid, "_sz_rel_bound_ratio", rel_ratio);
+}
+
+/*----< ncmpi_var_set_zlib_level() >----------------------------------------------*/
+/* This is a collective subroutine. */
+int ncmpi_var_set_zlib_level(int ncid, int varid, int level)
+{
+    return ncmpi_put_att_int(ncid, varid, "_zlib_level", NC_INT, 1, &level);
+}
+
+/*----< ncmpi_var_get_zlib_level() >----------------------------------------------*/
+int ncmpi_var_get_zlib_level(int ncid, int varid, int *level)
+{
+    return ncmpi_get_att_int(ncid, varid, "_zlib_level", level);
+}
+
+/*----< ncmpi_var_set_decomp_error_bound() >--------------------------------------*/
+/* Set target error bound for progressive decompression.
+ * This is a runtime setting that affects subsequent reads.
+ * target_rel_eb > 0: Decompress to specified precision
+ * target_rel_eb = 0: Full precision decompression (default)
+ */
+int ncmpi_var_set_decomp_error_bound(int ncid, int varid, double target_rel_eb)
+{
+    int err;
+    PNC *pncp;
+    
+    err = PNC_check_id(ncid, &pncp);
+    if (err != NC_NOERR) return err;
+    
+    /* For chunk I/O driver, call the specialized function */
+    /* Must verify driver is actually the chunk I/O driver before calling */
+    if (pncp->driver != NULL && pncp->ncp != NULL && 
+        pncp->driver == ncchkio_inq_driver()) {
+        /* This is the chunk driver, call the progressive decompression function */
+        err = ncchkio_var_set_progressive_error_bound(pncp->ncp, varid, target_rel_eb);
+        return err;
+    }
+    
+    /* Not using chunk I/O driver - progressive decompression not supported */
+    return NC_ENOTSUPPORT;
+}
+
+/*----< ncmpi_var_clear_decomp_error_bound() >------------------------------------*/
+/* Clear progressive decompression settings (restore full precision reads) */
+int ncmpi_var_clear_decomp_error_bound(int ncid, int varid)
+{
+    return ncmpi_var_set_decomp_error_bound(ncid, varid, 0.0);
+}
 #else
 /*----< ncmpi_var_set_chunk() >----------------------------------------------------*/
 /* This is a collective subroutine. */
@@ -300,6 +377,57 @@ int ncmpi_var_set_filter (int         ncid,    /* IN:  file ID */
 int ncmpi_var_get_filter (int         ncid,    /* IN:  file ID */
                           int         varid,
                           int        *filter)
+{
+    return NC_ENOTBUILT;
+}
+
+/*----< ncmpi_var_set_sz_abs_err_bound() >----------------------------------------*/
+/* This is a collective subroutine. */
+int ncmpi_var_set_sz_abs_err_bound(int ncid, int varid, double abs_err)
+{
+    return NC_ENOTBUILT;
+}
+
+/*----< ncmpi_var_get_sz_abs_err_bound() >----------------------------------------*/
+int ncmpi_var_get_sz_abs_err_bound(int ncid, int varid, double *abs_err)
+{
+    return NC_ENOTBUILT;
+}
+
+/*----< ncmpi_var_set_sz_rel_bound_ratio() >--------------------------------------*/
+/* This is a collective subroutine. */
+int ncmpi_var_set_sz_rel_bound_ratio(int ncid, int varid, double rel_ratio)
+{
+    return NC_ENOTBUILT;
+}
+
+/*----< ncmpi_var_get_sz_rel_bound_ratio() >--------------------------------------*/
+int ncmpi_var_get_sz_rel_bound_ratio(int ncid, int varid, double *rel_ratio)
+{
+    return NC_ENOTBUILT;
+}
+
+/*----< ncmpi_var_set_zlib_level() >----------------------------------------------*/
+/* This is a collective subroutine. */
+int ncmpi_var_set_zlib_level(int ncid, int varid, int level)
+{
+    return NC_ENOTBUILT;
+}
+
+/*----< ncmpi_var_get_zlib_level() >----------------------------------------------*/
+int ncmpi_var_get_zlib_level(int ncid, int varid, int *level)
+{
+    return NC_ENOTBUILT;
+}
+
+/*----< ncmpi_var_set_decomp_error_bound() >--------------------------------------*/
+int ncmpi_var_set_decomp_error_bound(int ncid, int varid, double target_rel_eb)
+{
+    return NC_ENOTBUILT;
+}
+
+/*----< ncmpi_var_clear_decomp_error_bound() >------------------------------------*/
+int ncmpi_var_clear_decomp_error_bound(int ncid, int varid)
 {
     return NC_ENOTBUILT;
 }

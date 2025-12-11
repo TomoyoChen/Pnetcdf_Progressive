@@ -11,6 +11,7 @@
 #define _PNETCDF_H
 
 #include <mpi.h>
+#include <stddef.h>  /* for size_t */
 
 #define PNETCDF_VERSION       "@PNETCDF_VERSION@"
 #define PNETCDF_VERSION_MAJOR @PNETCDF_VERSION_MAJOR@
@@ -794,6 +795,7 @@ ncmpi_def_var(int ncid, const char *name, nc_type xtype, int ndims,
 #define NC_FILTER_NONE	0
 #define NC_FILTER_DEFLATE	2
 #define NC_FILTER_SZ	3
+#define NC_FILTER_IPCOMP	4
 extern int
 ncmpi_var_set_chunk (int ncid, int varid, int *chunk_dim);
 extern int
@@ -802,6 +804,20 @@ extern int
 ncmpi_var_set_filter (int ncid, int varid, int filter);
 extern int
 ncmpi_var_get_filter (int ncid, int varid, int *filter);
+
+/* Progressive decompression API for Chunk I/O with IPComp filter.
+ * Allows reading compressed data at reduced precision for faster data transfer.
+ * 
+ * ncmpi_var_set_decomp_error_bound: Set target relative error bound for reads
+ *   - target_rel_eb > 0: Decompress to specified precision (e.g., 1e-2 = 1% error)
+ *   - target_rel_eb = 0: Full precision decompression (default)
+ * 
+ * ncmpi_var_clear_decomp_error_bound: Reset to full precision decompression
+ */
+extern int
+ncmpi_var_set_decomp_error_bound(int ncid, int varid, double target_rel_eb);
+extern int
+ncmpi_var_clear_decomp_error_bound(int ncid, int varid);
 
 extern int
 ncmpi_rename_dim(int ncid, int dimid, const char *name);
@@ -4594,3 +4610,61 @@ ncmpi_mget_varm_ulonglong_all(int ncid, int num, int *varids,
 }
 #endif
 #endif
+
+/* SZ compression parameter APIs */
+extern int
+ncmpi_var_set_sz_abs_err_bound(int ncid, int varid, double abs_err);
+extern int
+ncmpi_var_get_sz_abs_err_bound(int ncid, int varid, double *abs_err);
+extern int
+ncmpi_var_set_sz_rel_bound_ratio(int ncid, int varid, double rel_ratio);
+extern int
+ncmpi_var_get_sz_rel_bound_ratio(int ncid, int varid, double *rel_ratio);
+
+/* ZLIB compression parameter APIs */
+extern int
+ncmpi_var_set_zlib_level(int ncid, int varid, int level);
+extern int
+ncmpi_var_get_zlib_level(int ncid, int varid, int *level);
+
+#ifdef ENABLE_IPCOMP
+/* IPComp Progressive Compression APIs - Milestone M1 Implementation */
+
+/* Define progressive compression for a variable */
+extern int
+ncmpi_def_var_progressive(int ncid, int varid,
+                         const char* algo,           /* "ipcomp" */
+                         const char* interp,         /* "linear" or "cubic" */
+                         int layers,                 /* e.g., 1..9 */
+                         int group_bits,             /* 1 (32x1) */
+                         const double* ebs,          /* NULL = let codec estimate */
+                         int num_ebs,                /* == layers if ebs != NULL */
+                         size_t block_size,          /* codec block (0 = auto/CLI default) */
+                         int level_progressive);     /* >=0 (0 = auto/CLI default) */
+
+/* Write progressive compressed data */
+extern int
+ncmpi_put_vara_all_progressive(int ncid, int varid,
+                              const MPI_Offset *start, const MPI_Offset *count,
+                              const void *buf, MPI_Datatype buftype);
+
+/* Read with error bound constraint */
+extern int
+ncmpi_get_vara_progressive_error(int ncid, int varid,
+                                const MPI_Offset *start, const MPI_Offset *count,
+                                double target_rel_eb,
+                                void *buf, MPI_Datatype buftype);
+extern int
+ncmpi_get_vara_progressive_error_multi(int ncid, int varid,
+                                const MPI_Offset *start, const MPI_Offset *count,
+                                const double *target_rel_ebs, int num_target_ebs,
+                                void *buf, MPI_Datatype buftype);
+
+/* Read with bitrate constraint */
+extern int
+ncmpi_get_vara_progressive_bitrate(int ncid, int varid,
+                                  const MPI_Offset *start, const MPI_Offset *count,
+                                  double max_ratio_or_bytes,
+                                  void *buf, MPI_Datatype buftype);
+
+#endif /* ENABLE_IPCOMP */

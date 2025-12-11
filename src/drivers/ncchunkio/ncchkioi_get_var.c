@@ -84,16 +84,27 @@ int ncchkioi_get_var_cb_chunk (NC_chk *ncchkp,
 	memset (rcnt_local, 0, sizeof (int) * varp->nchunk);
 	nsend = 0;
 
-	// Iterate through chunks
-	ncchkioi_chunk_itr_init (varp, start, count, citr, &cid);
-	do {
-		rcnt_local[cid] = 1;
-
-		if (varp->chunk_owner[cid] != ncchkp->rank) {
-			// Count number of mnessage we need to send
-			nsend++;
+	// Check if there are any elements to read (count > 0 for all dimensions)
+	int has_elements = 1;
+	for (i = 0; i < varp->ndim; i++) {
+		if (count[i] == 0) {
+			has_elements = 0;
+			break;
 		}
-	} while (ncchkioi_chunk_itr_next (varp, start, count, citr, &cid));
+	}
+
+	// Iterate through chunks
+	if (has_elements) {
+		ncchkioi_chunk_itr_init (varp, start, count, citr, &cid);
+		do {
+			rcnt_local[cid] = 1;
+
+			if (varp->chunk_owner[cid] != ncchkp->rank) {
+				// Count number of mnessage we need to send
+				nsend++;
+			}
+		} while (ncchkioi_chunk_itr_next (varp, start, count, citr, &cid));
+	}
 
 	NC_CHK_TIMER_PAUSE (NC_CHK_TIMER_GET_CB_INIT)
 	NC_CHK_TIMER_START (NC_CHK_TIMER_GET_CB_SYNC)
@@ -150,11 +161,13 @@ int ncchkioi_get_var_cb_chunk (NC_chk *ncchkp,
 	CHK_PTR (rstats)
 	rbufs = (char **)NCI_Malloc (sizeof (char *) * (nrecv + nsend));
 	CHK_PTR (rbufs)
+	memset (rbufs, 0, sizeof (char *) * (nrecv + nsend));  // Initialize to NULL
 	rsizes = (int *)NCI_Malloc (sizeof (int) * (nrecv + nsend));
 	CHK_PTR (rsizes)
 	// We need to send nsend requests and reply nrecv of requests
 	sbufs = (char **)NCI_Malloc (sizeof (char *) * (nrecv + nsend));
 	CHK_PTR (sbufs)
+	memset (sbufs, 0, sizeof (char *) * (nrecv + nsend));  // Initialize to NULL
 	sreqs = (MPI_Request *)NCI_Malloc (sizeof (MPI_Request) * (nrecv + nsend));
 	CHK_PTR (sreqs)
 	sstats = (MPI_Status *)NCI_Malloc (sizeof (MPI_Status) * (nrecv + nsend));
@@ -162,54 +175,55 @@ int ncchkioi_get_var_cb_chunk (NC_chk *ncchkp,
 
 	// Post send
 	k = 0;
-	// Initialize chunk iterator
-	ncchkioi_chunk_itr_init_ex (varp, start, count, citr, &cid, ostart, osize);
-	// Iterate through chunks
-	do {
-		// We got something to send if we are not owner
-		if (varp->chunk_owner[cid] != ncchkp->rank) {
-			NC_CHK_TIMER_START (NC_CHK_TIMER_GET_CB_PACK_REQ)
+	// Initialize chunk iterator and iterate through chunks
+	if (has_elements) {
+		ncchkioi_chunk_itr_init_ex (varp, start, count, citr, &cid, ostart, osize);
+		do {
+			// We got something to send if we are not owner
+			if (varp->chunk_owner[cid] != ncchkp->rank) {
+				NC_CHK_TIMER_START (NC_CHK_TIMER_GET_CB_PACK_REQ)
 
-			// Calculate chunk overlap
-			overlapsize = varp->esize;
-			for (j = 0; j < varp->ndim; j++) { overlapsize *= osize[j]; }
+				// Calculate chunk overlap
+				overlapsize = varp->esize;
+				for (j = 0; j < varp->ndim; j++) { overlapsize *= osize[j]; }
 
-			// Allocate buffer
-			sbufs[k] = (char *)NCI_Malloc (sizeof (int) * varp->ndim * 2);	// For request
-			CHK_PTR (sbufs[k])
-			rbufs[k + nrecv] =
-				(char *)NCI_Malloc (overlapsize);  // For reply, first nrecv are for request
-			CHK_PTR (rbufs[k + nrecv])
+				// Allocate buffer
+				sbufs[k] = (char *)NCI_Malloc (sizeof (int) * varp->ndim * 2);	// For request
+				CHK_PTR (sbufs[k])
+				rbufs[k + nrecv] =
+					(char *)NCI_Malloc (overlapsize);  // For reply, first nrecv are for request
+				CHK_PTR (rbufs[k + nrecv])
 
-			// Metadata
-			tstartp = (int *)sbufs[k];
-			packoff = varp->ndim * sizeof (int);
-			tsizep	= (int *)(sbufs[k] + packoff);
-			packoff += varp->ndim * sizeof (int);
-			for (j = 0; j < varp->ndim; j++) {
-				tstartp[j] = (int)(ostart[j] - citr[j]);
-				tsizep[j]  = (int)osize[j];
+				// Metadata
+				tstartp = (int *)sbufs[k];
+				packoff = varp->ndim * sizeof (int);
+				tsizep	= (int *)(sbufs[k] + packoff);
+				packoff += varp->ndim * sizeof (int);
+				for (j = 0; j < varp->ndim; j++) {
+					tstartp[j] = (int)(ostart[j] - citr[j]);
+					tsizep[j]  = (int)osize[j];
+				}
+
+				NC_CHK_TIMER_STOP (NC_CHK_TIMER_GET_CB_PACK_REQ)
+				NC_CHK_TIMER_START (NC_CHK_TIMER_GET_CB_SEND_REQ)
+
+				// Send request
+				CHK_ERR_ISEND (sbufs[k], packoff, MPI_BYTE, varp->chunk_owner[cid], cid, ncchkp->comm,
+							   sreqs + k);
+
+				NC_CHK_TIMER_STOP (NC_CHK_TIMER_GET_CB_SEND_REQ)
+				NC_CHK_TIMER_START (NC_CHK_TIMER_GET_CB_RECV_REP)
+
+				// Post recv reply
+				CHK_ERR_IRECV (rbufs[k + nrecv], overlapsize, MPI_BYTE, varp->chunk_owner[cid],
+							   cid + 1024, ncchkp->comm, rreqs + nrecv + k);
+
+				NC_CHK_TIMER_STOP (NC_CHK_TIMER_GET_CB_RECV_REP)
+
+				k++;
 			}
-
-			NC_CHK_TIMER_STOP (NC_CHK_TIMER_GET_CB_PACK_REQ)
-			NC_CHK_TIMER_START (NC_CHK_TIMER_GET_CB_SEND_REQ)
-
-			// Send request
-			CHK_ERR_ISEND (sbufs[k], packoff, MPI_BYTE, varp->chunk_owner[cid], cid, ncchkp->comm,
-						   sreqs + k);
-
-			NC_CHK_TIMER_STOP (NC_CHK_TIMER_GET_CB_SEND_REQ)
-			NC_CHK_TIMER_START (NC_CHK_TIMER_GET_CB_RECV_REP)
-
-			// Post recv reply
-			CHK_ERR_IRECV (rbufs[k + nrecv], overlapsize, MPI_BYTE, varp->chunk_owner[cid],
-						   cid + 1024, ncchkp->comm, rreqs + nrecv + k);
-
-			NC_CHK_TIMER_STOP (NC_CHK_TIMER_GET_CB_RECV_REP)
-
-			k++;
-		}
-	} while (ncchkioi_chunk_itr_next_ex (varp, start, count, citr, &cid, ostart, osize));
+		} while (ncchkioi_chunk_itr_next_ex (varp, start, count, citr, &cid, ostart, osize));
+	}
 
 	NC_CHK_TIMER_START (NC_CHK_TIMER_GET_CB_RECV_REQ)
 
@@ -425,8 +439,8 @@ err_out:;
 	NCI_Free (ostart);
 
 	for (i = 0; i < nsend + nrecv; i++) {
-		NCI_Free (sbufs[i]);
-		NCI_Free (rbufs[i]);
+		if (sbufs != NULL && sbufs[i] != NULL) NCI_Free (sbufs[i]);
+		if (rbufs != NULL && rbufs[i] != NULL) NCI_Free (rbufs[i]);
 	}
 	NCI_Free (sreqs);
 	NCI_Free (sstats);
@@ -511,19 +525,31 @@ int ncchkioi_get_var_cb_proc (NC_chk *ncchkp,
 	// datastructure
 	rrange_local[0] = varp->nchunk;
 	rrange_local[1] = 0;
-	ncchkioi_chunk_itr_init (varp, start, count, citr, &cid);  // Initialize chunk iterator
-	do {
-		// Chunk owner
-		cown = varp->chunk_owner[cid];
+	
+	// Check if there are any elements to read (count > 0 for all dimensions)
+	int has_elements = 1;
+	for (i = 0; i < varp->ndim; i++) {
+		if (count[i] == 0) {
+			has_elements = 0;
+			break;
+		}
+	}
+	
+	if (has_elements) {
+		ncchkioi_chunk_itr_init (varp, start, count, citr, &cid);  // Initialize chunk iterator
+		do {
+			// Chunk owner
+			cown = varp->chunk_owner[cid];
 
-		// Mapping to skip list of send requests
-		if (rcnt_local[cown] == 0 && cown != ncchkp->rank) { smap[cown] = nsend++; }
-		rcnt_local[cown] = 1;  // Need to send message if not owner
+			// Mapping to skip list of send requests
+			if (rcnt_local[cown] == 0 && cown != ncchkp->rank) { smap[cown] = nsend++; }
+			rcnt_local[cown] = 1;  // Need to send message if not owner
 
-		// Record lowest and highest chunk accessed
-		if (rrange_local[0] > cid) { rrange_local[0] = cid; }
-		if (rrange_local[1] < cid) { rrange_local[1] = cid; }
-	} while (ncchkioi_chunk_itr_next (varp, start, count, citr, &cid));
+			// Record lowest and highest chunk accessed
+			if (rrange_local[0] > cid) { rrange_local[0] = cid; }
+			if (rrange_local[1] < cid) { rrange_local[1] = cid; }
+		} while (ncchkioi_chunk_itr_next (varp, start, count, citr, &cid));
+	}
 
 	NC_CHK_TIMER_STOP (NC_CHK_TIMER_GET_CB_INIT)
 	NC_CHK_TIMER_START (NC_CHK_TIMER_GET_CB_SYNC)
@@ -543,6 +569,7 @@ int ncchkioi_get_var_cb_proc (NC_chk *ncchkp,
 	// Allocate data structure for messaging
 	sbuf = (char **)NCI_Malloc (sizeof (char *) * (2 * nsend + nrecv));
 	CHK_PTR (sbuf)
+	memset (sbuf, 0, sizeof (char *) * (2 * nsend + nrecv));  // Initialize to NULL
 	ssize = (int *)NCI_Malloc (sizeof (int) * (nsend * 2 + nrecv * 1));
 	CHK_PTR (ssize)
 	sdst = ssize + (nsend + nrecv);
@@ -553,6 +580,7 @@ int ncchkioi_get_var_cb_proc (NC_chk *ncchkp,
 
 	rbuf = (char **)NCI_Malloc (sizeof (char *) * (nsend + nrecv * 2));
 	CHK_PTR (rbuf)
+	memset (rbuf, 0, sizeof (char *) * (nsend + nrecv * 2));  // Initialize to NULL
 	rsize = (int *)NCI_Malloc (sizeof (int) * (nsend + nrecv));
 	CHK_PTR (rsize)
 	rreq = (MPI_Request *)NCI_Malloc (sizeof (MPI_Request) * (nsend + nrecv));
@@ -572,22 +600,24 @@ int ncchkioi_get_var_cb_proc (NC_chk *ncchkp,
 	// Count size of each request
 	memset (ssize, 0, sizeof (int) * nsend);
 	memset (rsize_re, 0, sizeof (int) * nsend);
-	ncchkioi_chunk_itr_init_ex (varp, start, count, citr, &cid, ostart,
-								osize);	 // Initialize chunk iterator
-	do {
-		// Chunk owner
-		cown = varp->chunk_owner[cid];
-		if (cown != ncchkp->rank) {
-			j		= smap[cown];
-			sdst[j] = cown;	 // Record a reverse map by the way
+	if (has_elements) {
+		ncchkioi_chunk_itr_init_ex (varp, start, count, citr, &cid, ostart,
+									osize);	 // Initialize chunk iterator
+		do {
+			// Chunk owner
+			cown = varp->chunk_owner[cid];
+			if (cown != ncchkp->rank) {
+				j		= smap[cown];
+				sdst[j] = cown;	 // Record a reverse map by the way
 
-			// Count overlap
-			overlapsize = varp->esize;
-			for (i = 0; i < varp->ndim; i++) { overlapsize *= osize[i]; }
-			ssize[j] += sizeof (int) * (varp->ndim * 2 + 1);
-			rsize_re[j] += overlapsize;
-		}
-	} while (ncchkioi_chunk_itr_next_ex (varp, start, count, citr, &cid, ostart, osize));
+				// Count overlap
+				overlapsize = varp->esize;
+				for (i = 0; i < varp->ndim; i++) { overlapsize *= osize[i]; }
+				ssize[j] += sizeof (int) * (varp->ndim * 2 + 1);
+				rsize_re[j] += overlapsize;
+			}
+		} while (ncchkioi_chunk_itr_next_ex (varp, start, count, citr, &cid, ostart, osize));
+	}
 
 	// Allocate buffer for send
 	for (i = 0; i < nsend; i++) {
@@ -601,27 +631,29 @@ int ncchkioi_get_var_cb_proc (NC_chk *ncchkp,
 	}
 
 	// Pack requests
-	ncchkioi_chunk_itr_init_ex (varp, start, count, citr, &cid, ostart,
-								osize);	 // Initialize chunk iterator
-	do {
-		// Chunk owner
-		cown = varp->chunk_owner[cid];
-		if (cown != ncchkp->rank) {
-			j = smap[cown];
+	if (has_elements) {
+		ncchkioi_chunk_itr_init_ex (varp, start, count, citr, &cid, ostart,
+									osize);	 // Initialize chunk iterator
+		do {
+			// Chunk owner
+			cown = varp->chunk_owner[cid];
+			if (cown != ncchkp->rank) {
+				j = smap[cown];
 
-			// Metadata
-			*((int *)sbufp[j]) = cid;
-			sbufp[j] += sizeof (int);
-			tstartp = (int *)sbufp[j];
-			sbufp[j] += sizeof (int) * varp->ndim;
-			tssizep = (int *)sbufp[j];
-			sbufp[j] += sizeof (int) * varp->ndim;
-			for (i = 0; i < varp->ndim; i++) {
-				tstartp[i] = (int)(ostart[i] - citr[i]);
-				tssizep[i] = (int)osize[i];
+				// Metadata
+				*((int *)sbufp[j]) = cid;
+				sbufp[j] += sizeof (int);
+				tstartp = (int *)sbufp[j];
+				sbufp[j] += sizeof (int) * varp->ndim;
+				tssizep = (int *)sbufp[j];
+				sbufp[j] += sizeof (int) * varp->ndim;
+				for (i = 0; i < varp->ndim; i++) {
+					tstartp[i] = (int)(ostart[i] - citr[i]);
+					tssizep[i] = (int)osize[i];
+				}
 			}
-		}
-	} while (ncchkioi_chunk_itr_next_ex (varp, start, count, citr, &cid, ostart, osize));
+		} while (ncchkioi_chunk_itr_next_ex (varp, start, count, citr, &cid, ostart, osize));
+	}
 
 	NC_CHK_TIMER_STOP (NC_CHK_TIMER_GET_CB_PACK_REQ)
 	NC_CHK_TIMER_START (NC_CHK_TIMER_GET_CB_SEND_REQ)
@@ -703,42 +735,44 @@ int ncchkioi_get_var_cb_proc (NC_chk *ncchkp,
 	tbuf = (char *)NCI_Malloc (varp->chunksize);
 
 	// Handle our own data
-	ncchkioi_chunk_itr_init_ex (varp, start, count, citr, &cid, ostart,
-								osize);	 // Initialize chunk iterator
-	do {
-		if (varp->chunk_owner[cid] == ncchkp->rank) {
-			// Pack type from chunk cache to (contiguous) intermediate buffer
-			for (j = 0; j < varp->ndim; j++) {
-				tstart[j] = (int)(ostart[j] - citr[j]);
-				tsize[j]  = varp->chunkdim[j];
-				tssize[j] = (int)osize[j];
+	if (has_elements) {
+		ncchkioi_chunk_itr_init_ex (varp, start, count, citr, &cid, ostart,
+									osize);	 // Initialize chunk iterator
+		do {
+			if (varp->chunk_owner[cid] == ncchkp->rank) {
+				// Pack type from chunk cache to (contiguous) intermediate buffer
+				for (j = 0; j < varp->ndim; j++) {
+					tstart[j] = (int)(ostart[j] - citr[j]);
+					tsize[j]  = varp->chunkdim[j];
+					tssize[j] = (int)osize[j];
+				}
+				CHK_ERR_TYPE_CREATE_SUBARRAY (varp->ndim, tsize, tssize, tstart, MPI_ORDER_C,
+											  varp->etype, &ptype);
+				CHK_ERR_TYPE_COMMIT (&ptype);
+
+				// Pack data into intermediate buffer
+				packoff = 0;
+				CHK_ERR_PACK (varp->chunk_cache[cid]->buf, 1, ptype, tbuf, varp->chunksize, &packoff,
+							  ncchkp->comm);
+				MPI_Type_free (&ptype);
+				overlapsize = packoff;
+
+				// Pack type from (contiguous) intermediate buffer to chunk buffer
+				for (j = 0; j < varp->ndim; j++) {
+					tstart[j] = (int)(ostart[j] - start[j]);
+					tsize[j]  = (int)count[j];
+				}
+				CHK_ERR_TYPE_CREATE_SUBARRAY (varp->ndim, tsize, tssize, tstart, MPI_ORDER_C,
+											  varp->etype, &ptype);
+				CHK_ERR_TYPE_COMMIT (&ptype);
+
+				// Unpack data into chunk buffer
+				packoff = 0;
+				CHK_ERR_UNPACK (tbuf, overlapsize, &packoff, buf, 1, ptype, ncchkp->comm);
+				MPI_Type_free (&ptype);
 			}
-			CHK_ERR_TYPE_CREATE_SUBARRAY (varp->ndim, tsize, tssize, tstart, MPI_ORDER_C,
-										  varp->etype, &ptype);
-			CHK_ERR_TYPE_COMMIT (&ptype);
-
-			// Pack data into intermediate buffer
-			packoff = 0;
-			CHK_ERR_PACK (varp->chunk_cache[cid]->buf, 1, ptype, tbuf, varp->chunksize, &packoff,
-						  ncchkp->comm);
-			MPI_Type_free (&ptype);
-			overlapsize = packoff;
-
-			// Pack type from (contiguous) intermediate buffer to chunk buffer
-			for (j = 0; j < varp->ndim; j++) {
-				tstart[j] = (int)(ostart[j] - start[j]);
-				tsize[j]  = (int)count[j];
-			}
-			CHK_ERR_TYPE_CREATE_SUBARRAY (varp->ndim, tsize, tssize, tstart, MPI_ORDER_C,
-										  varp->etype, &ptype);
-			CHK_ERR_TYPE_COMMIT (&ptype);
-
-			// Unpack data into chunk buffer
-			packoff = 0;
-			CHK_ERR_UNPACK (tbuf, overlapsize, &packoff, buf, 1, ptype, ncchkp->comm);
-			MPI_Type_free (&ptype);
-		}
-	} while (ncchkioi_chunk_itr_next_ex (varp, start, count, citr, &cid, ostart, osize));
+		} while (ncchkioi_chunk_itr_next_ex (varp, start, count, citr, &cid, ostart, osize));
+	}
 
 	NC_CHK_TIMER_STOP (NC_CHK_TIMER_GET_CB_SELF)
 
@@ -861,8 +895,8 @@ err_out:;
 	NCI_Free (sstat);
 	NCI_Free (ssize);
 	for (i = 0; i < nsend + nrecv; i++) {
-		NCI_Free (sbuf[i]);
-		NCI_Free (rbuf[i]);
+		if (sbuf != NULL && sbuf[i] != NULL) NCI_Free (sbuf[i]);
+		if (rbuf != NULL && rbuf[i] != NULL) NCI_Free (rbuf[i]);
 	}
 	NCI_Free (sbuf);
 

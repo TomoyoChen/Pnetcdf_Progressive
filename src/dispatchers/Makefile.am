@@ -11,6 +11,7 @@ SUFFIXES = .o .c .h .m4
 AM_CPPFLAGS  = -I${top_srcdir}/src/include
 AM_CPPFLAGS += -I${top_builddir}/src/include
 AM_CPPFLAGS += -I${top_srcdir}/src/drivers/include
+AM_CPPFLAGS += -I$(top_srcdir)/src/drivers/ncchunkio -I$(top_builddir)/src/drivers/ncchunkio
 AM_CPPFLAGS += @NETCDF4_INC@ @ADIOS_INC@
 
 if PNETCDF_DEBUG
@@ -29,7 +30,8 @@ C_SRCS = lib_version.c \
          dimension.c \
          variable.c \
          attribute.c \
-         error_codes.c
+         error_codes.c \
+         progressive.c
 
 libdispatchers_la_SOURCES = $(C_SRCS)
 

@@ -29,7 +29,7 @@ int ncchk_dummy_finalize() {
 /* Return an estimated compressed data size
  * Actual compressed size should not exceed the estimation
  */
-int ncchk_dummy_inq_cpsize(void *in, int in_len, int *out_len, int ndim, int *dims, MPI_Datatype dtype) {
+int ncchk_dummy_inq_cpsize(void *in, int in_len, int *out_len, int ndim, int *dims, MPI_Datatype dtype, NCCHK_var_context* ctx) {
     *out_len = in_len;
     return NC_NOERR;
 }
@@ -37,7 +37,7 @@ int ncchk_dummy_inq_cpsize(void *in, int in_len, int *out_len, int ndim, int *di
 /* If out_len is large enough, compress the data at in and save it to out. out_len is set to actual compressed data size
  * If out_len is NULL, we assume out is large enough for compressed data
  */
-int ncchk_dummy_compress(void *in, int in_len, void *out, int *out_len, int ndim, int *dims, MPI_Datatype dtype) {
+int ncchk_dummy_compress(void *in, int in_len, void *out, int *out_len, int ndim, int *dims, MPI_Datatype dtype, NCCHK_var_context* ctx) {
     if (out_len != NULL){
         // Check output buffer size
         if ((*out_len) < in_len){
@@ -58,7 +58,7 @@ int ncchk_dummy_compress(void *in, int in_len, void *out, int *out_len, int ndim
  * The caller is responsible to free the buffer
  * If out_len is not NULL, it will be set to buffer size allocated
  */
-int ncchk_dummy_compress_alloc(void *in, int in_len, void **out, int *out_len, int ndim, int *dims, MPI_Datatype dtype) {
+int ncchk_dummy_compress_alloc(void *in, int in_len, void **out, int *out_len, int ndim, int *dims, MPI_Datatype dtype, NCCHK_var_context* ctx) {
     // Allocate output buffer
     *out = (void*)malloc(in_len);
 
@@ -76,7 +76,7 @@ int ncchk_dummy_compress_alloc(void *in, int in_len, void **out, int *out_len, i
 /* Return an estimated decompressed data size
  * Actual decompressed size should not exceed the estimation
  */
-int ncchk_dummy_inq_dcsize(void *in, int in_len, int *out_len, int ndim, int *dims, MPI_Datatype dtype) {
+int ncchk_dummy_inq_dcsize(void *in, int in_len, int *out_len, int ndim, int *dims, MPI_Datatype dtype, NCCHK_var_context* ctx) {
     *out_len = in_len;
     return NC_NOERR;
 }
@@ -84,7 +84,7 @@ int ncchk_dummy_inq_dcsize(void *in, int in_len, int *out_len, int ndim, int *di
 /* If out_len is large enough, decompress the data at in and save it to out. out_len is set to actual decompressed size
  * If out_len is NULL, we assume out is large enough for decompressed data
  */
-int ncchk_dummy_decompress(void *in, int in_len, void *out, int *out_len, int ndim, int *dims, MPI_Datatype dtype) {
+int ncchk_dummy_decompress(void *in, int in_len, void *out, int *out_len, int ndim, int *dims, MPI_Datatype dtype, NCCHK_var_context* ctx) {
     if (out_len != NULL){
         // Check output buffer size
         if ((*out_len) < in_len){
@@ -105,7 +105,7 @@ int ncchk_dummy_decompress(void *in, int in_len, void *out, int *out_len, int nd
  * The caller is responsible to free the buffer
  * If out_len is not NULL, it will be set to buffer size allocated
  */
-int ncchk_dummy_decompress_alloc(void *in, int in_len, void **out, int *out_len, int ndim, int *dims, MPI_Datatype dtype) {
+int ncchk_dummy_decompress_alloc(void *in, int in_len, void **out, int *out_len, int ndim, int *dims, MPI_Datatype dtype, NCCHK_var_context* ctx) {
     // Allocate output buffer
     *out = (void*)malloc(in_len);
 

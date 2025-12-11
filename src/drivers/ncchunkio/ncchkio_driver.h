@@ -117,6 +117,31 @@ typedef struct NC_chk_var {
 	NCCHK_filter *filter_driver; /* Compression driver */
 	int filter;
 
+	/* Variable-level compression parameters */
+	double sz_abs_err_bound;    /* SZ absolute error bound */
+	double sz_rel_bound_ratio;  /* SZ relative error bound ratio */
+	int zlib_level;             /* ZLIB compression level (1-9) */
+	
+	/* IPComp progressive compression parameters */
+	int ipcomp_layers;          /* Number of progressive layers */
+	int ipcomp_interp;          /* Interpolation method (0=linear, 1=cubic) */
+	int ipcomp_direction;       /* Direction for progressive compression */
+	int ipcomp_level_progressive; /* Progressive level */
+	size_t ipcomp_block_size;   /* Block size for codec */
+	double *ipcomp_ebs;         /* Error bounds per layer */
+	int ipcomp_num_ebs;         /* Number of error bounds */
+	double ipcomp_data_range;   /* Global data range hint */
+	double ipcomp_data_min;     /* Global minimum for verification/logging */
+	double ipcomp_data_max;     /* Global maximum for verification/logging */
+	int    ipcomp_has_minmax;   /* Flag indicating min/max validity */
+	int    ipcomp_has_fill;     /* Whether _FillValue is defined */
+	double ipcomp_fill_value;   /* Stored as double for both float/double vars */
+	size_t ipcomp_header_size;  /* Sparse chunk header size */
+	
+	/* Progressive decompression target (set by user for partial precision reads) */
+	double ipcomp_target_error_bound;  /* Target relative error bound for decompression (0 = full precision) */
+	int ipcomp_use_progressive_decomp; /* Flag to enable progressive decompression */
+
 	int chunk_map_method;
 } NC_chk_var;
 
@@ -418,5 +443,9 @@ extern int ncchkio_buffer_detach (void *ncdp);
 extern int ncchkio_wait (void *ncdp, int num_reqs, int *req_ids, int *statuses, int reqMode);
 
 extern int ncchkio_cancel (void *ncdp, int num_reqs, int *req_ids, int *statuses);
+
+/* Progressive decompression support for Chunk I/O */
+extern int ncchkio_var_set_progressive_error_bound(void *ncdp, int varid, double target_rel_eb);
+extern int ncchkio_var_clear_progressive_error_bound(void *ncdp, int varid);
 
 #endif
