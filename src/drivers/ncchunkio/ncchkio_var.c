@@ -78,6 +78,7 @@ int ncchkio_def_var (
 	varp->ipcomp_direction = 0;
 	varp->ipcomp_level_progressive = 0;
 	varp->ipcomp_block_size = IPCOMP_DEFAULT_BLOCK_SIZE;
+	varp->ipcomp_interp_dim_limit = IPCOMP_DEFAULT_INTERP_DIM_LIMIT;
 	varp->ipcomp_num_ebs = 0;
 	varp->ipcomp_ebs = NULL;
 	varp->ipcomp_data_range = 0.0;

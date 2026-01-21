@@ -21,6 +21,11 @@
  #include <stdint.h>
 #include "../drivers/ncmpio/ncmpio_NC.h"
 
+#ifndef IPCOMP_DEFAULT_INTERP_DIM_LIMIT
+/* Must be even. Used by IPComp/SZ3 to avoid extrapolation. */
+#define IPCOMP_DEFAULT_INTERP_DIM_LIMIT 50000
+#endif
+
 typedef struct {
     size_t prelude_size;
     size_t dims_offset;
@@ -613,6 +618,12 @@ static int write_progressive_frames(int ncid, int varid, const void *buf,
     size_t effective_block_size = (block_size_attr > 0)
                                       ? (size_t)block_size_attr
                                       : (size_t)IPCOMP_DEFAULT_BLOCK_SIZE;
+
+    int interp_dim_limit_attr = 0;
+    err = ncmpi_get_att_int(ncid, varid, "comp:interp_dim_limit", &interp_dim_limit_attr);
+    if (err != NC_NOERR) interp_dim_limit_attr = IPCOMP_DEFAULT_INTERP_DIM_LIMIT;
+    if (interp_dim_limit_attr & 1) interp_dim_limit_attr--;
+    if (interp_dim_limit_attr < 2) interp_dim_limit_attr = 2;
     
     /* Get current container length to determine cursor position (design doc §7.2 step 1) */
     {
@@ -669,6 +680,7 @@ if (strcmp(algo, "ipcomp") == 0) {
     ctx->ipcomp_interp             = 1;   /* cubic by default (matches CLI) */
     ctx->ipcomp_direction          = 0;
     ctx->ipcomp_block_size         = effective_block_size;
+    ctx->ipcomp_interp_dim_limit   = (size_t)interp_dim_limit_attr;
     
     t_end = MPI_Wtime();
     timer_setup = t_end - t_start;
@@ -1027,6 +1039,12 @@ static int read_progressive_frames_error_impl(int ncid, int varid, void *buf,
        err = ncmpi_get_att_int(ncid, varid, "comp:block_size", &block_size_attr);
        if (err != NC_NOERR) block_size_attr = 0;
 
+       int interp_dim_limit_attr = 0;
+       err = ncmpi_get_att_int(ncid, varid, "comp:interp_dim_limit", &interp_dim_limit_attr);
+       if (err != NC_NOERR) interp_dim_limit_attr = IPCOMP_DEFAULT_INTERP_DIM_LIMIT;
+       if (interp_dim_limit_attr & 1) interp_dim_limit_attr--;
+       if (interp_dim_limit_attr < 2) interp_dim_limit_attr = 2;
+
        double stored_range = 0.0;
        err = header_read_double(ncid, varid, header_layout.range_offset, &stored_range);
        if (err != NC_NOERR) goto cleanup_read_error;
@@ -1061,6 +1079,7 @@ static int read_progressive_frames_error_impl(int ncid, int varid, void *buf,
       ctx_local.ipcomp_layers = layers_attr;
         ctx_local.ipcomp_level_progressive = level_prog_attr;
         ctx_local.ipcomp_block_size = effective_block_size_read;
+        ctx_local.ipcomp_interp_dim_limit = (size_t)interp_dim_limit_attr;
         ctx_local.ipcomp_interp = interp_op;
         ctx_local.ipcomp_direction = 0;
       ctx_local.ipcomp_data_range = stored_range;
@@ -1448,6 +1467,12 @@ static int read_progressive_frames_bitrate(int ncid, int varid, void *buf,
         err = ncmpi_get_att_int(ncid, varid, "comp:block_size", &block_size_attr);
         if (err != NC_NOERR) block_size_attr = 0;
 
+        int interp_dim_limit_attr = 0;
+        err = ncmpi_get_att_int(ncid, varid, "comp:interp_dim_limit", &interp_dim_limit_attr);
+        if (err != NC_NOERR) interp_dim_limit_attr = IPCOMP_DEFAULT_INTERP_DIM_LIMIT;
+        if (interp_dim_limit_attr & 1) interp_dim_limit_attr--;
+        if (interp_dim_limit_attr < 2) interp_dim_limit_attr = 2;
+
         double stored_range = 0.0;
         err = header_read_double(ncid, varid, header_layout.range_offset, &stored_range);
         if (err != NC_NOERR) goto cleanup_read_bitrate;
@@ -1481,6 +1506,7 @@ static int read_progressive_frames_bitrate(int ncid, int varid, void *buf,
                                                ? (size_t)block_size_attr
                                                : (size_t)IPCOMP_DEFAULT_BLOCK_SIZE;
         ctx_local.ipcomp_block_size = effective_block_size_read;
+        ctx_local.ipcomp_interp_dim_limit = (size_t)interp_dim_limit_attr;
         ctx_local.ipcomp_interp = interp_op;
         ctx_local.ipcomp_direction = 0;
         ctx_local.ipcomp_data_range = stored_range;
@@ -1895,6 +1921,15 @@ cleanup_read_bitrate:
     int block_size_int = (int)effective_block_size_def;
     err = ncmpi_put_att_int(ncid, varid, "comp:block_size", NC_INT, 1, &block_size_int);
      if (err != NC_NOERR) return err;
+
+     /* comp:interp_dim_limit (even) */
+     {
+         int interp_dim_limit_int = IPCOMP_DEFAULT_INTERP_DIM_LIMIT;
+         if (interp_dim_limit_int & 1) interp_dim_limit_int--;
+         if (interp_dim_limit_int < 2) interp_dim_limit_int = 2;
+         err = ncmpi_put_att_int(ncid, varid, "comp:interp_dim_limit", NC_INT, 1, &interp_dim_limit_int);
+         if (err != NC_NOERR) return err;
+     }
      
      /* comp:layout */
      err = ncmpi_put_att_text(ncid, varid, "comp:layout", 11, "chunk-major");

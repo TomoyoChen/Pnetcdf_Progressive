@@ -128,6 +128,7 @@ typedef struct NC_chk_var {
 	int ipcomp_direction;       /* Direction for progressive compression */
 	int ipcomp_level_progressive; /* Progressive level */
 	size_t ipcomp_block_size;   /* Block size for codec */
+	size_t ipcomp_interp_dim_limit; /* Interp dimension limit (even), for IPComp/SZ3 */
 	double *ipcomp_ebs;         /* Error bounds per layer */
 	int ipcomp_num_ebs;         /* Number of error bounds */
 	double ipcomp_data_range;   /* Global data range hint */

@@ -88,17 +88,28 @@ int ncchkioi_save_var (NC_chk *ncchkp, NC_chk_var *varp) {
 				ctx.zlib_level = varp->zlib_level;
 				ctx.varid = varp->varid;
 #ifdef ENABLE_IPCOMP
+				/* provide attribute access for IPComp sidecar */
+				ctx.ipcomp_put_att = ncchkp->driver->put_att;
+				ctx.ipcomp_get_att = ncchkp->driver->get_att;
+				ctx.ipcomp_ncp     = ncchkp->ncp;
+				ctx.ipcomp_varid   = varp->varid;
+#endif
+#ifdef ENABLE_IPCOMP
 				ctx.ipcomp_layers = varp->ipcomp_layers;
 				ctx.ipcomp_interp = varp->ipcomp_interp;
 				ctx.ipcomp_direction = varp->ipcomp_direction;
 				ctx.ipcomp_level_progressive = varp->ipcomp_level_progressive;
 				ctx.ipcomp_block_size = varp->ipcomp_block_size;
+				ctx.ipcomp_interp_dim_limit = varp->ipcomp_interp_dim_limit;
 				ctx.ipcomp_ebs = varp->ipcomp_ebs;
 				ctx.ipcomp_num_ebs = varp->ipcomp_num_ebs;
 				ctx.ipcomp_data_range = varp->ipcomp_data_range;
 				ctx.ipcomp_data_min = varp->ipcomp_data_min;
 				ctx.ipcomp_data_max = varp->ipcomp_data_max;
 				ctx.ipcomp_has_minmax = varp->ipcomp_has_minmax;
+				ctx.ipcomp_has_fill = varp->ipcomp_has_fill;
+				ctx.ipcomp_fill_value = varp->ipcomp_fill_value;
+				ctx.ipcomp_header_size = varp->ipcomp_header_size;
 				if (varp->filter == NC_CHK_FILTER_IPCOMP) {
 					const double *bufd = (varp->etype == MPI_DOUBLE)
 											 ? (const double *)varp->chunk_cache[k]->buf
@@ -111,12 +122,14 @@ int ncchkioi_save_var (NC_chk *ncchkp, NC_chk_var *varp) {
 					if (buff != NULL) {
 						for (size_t ei = 0; ei < elem_cnt; ei++) {
 							double v = (double)buff[ei];
+							if (ctx.ipcomp_has_fill && v == ctx.ipcomp_fill_value) continue;
 							if (v < rmin) { rmin = v; }
 							if (v > rmax) { rmax = v; }
 						}
 					} else if (bufd != NULL) {
 						for (size_t ei = 0; ei < elem_cnt; ei++) {
 							double v = bufd[ei];
+							if (ctx.ipcomp_has_fill && v == ctx.ipcomp_fill_value) continue;
 							if (v < rmin) { rmin = v; }
 							if (v > rmax) { rmax = v; }
 						}
@@ -444,11 +457,18 @@ int ncchkioi_save_nvar (NC_chk *ncchkp, int nvar, int *varids) {
 					ctx.zlib_level = varp->zlib_level;
 					ctx.varid = varp->varid;
 #ifdef ENABLE_IPCOMP
+					ctx.ipcomp_put_att = ncchkp->driver->put_att;
+					ctx.ipcomp_get_att = ncchkp->driver->get_att;
+					ctx.ipcomp_ncp     = ncchkp->ncp;
+					ctx.ipcomp_varid   = varp->varid;
+#endif
+#ifdef ENABLE_IPCOMP
 					ctx.ipcomp_layers = varp->ipcomp_layers;
 					ctx.ipcomp_interp = varp->ipcomp_interp;
 					ctx.ipcomp_direction = varp->ipcomp_direction;
 					ctx.ipcomp_level_progressive = varp->ipcomp_level_progressive;
 					ctx.ipcomp_block_size = varp->ipcomp_block_size;
+					ctx.ipcomp_interp_dim_limit = varp->ipcomp_interp_dim_limit;
 					ctx.ipcomp_ebs = varp->ipcomp_ebs;
 					ctx.ipcomp_num_ebs = varp->ipcomp_num_ebs;
 					ctx.ipcomp_data_range = varp->ipcomp_data_range;

@@ -24,6 +24,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <mpi.h>
 #include <pnc_debug.h>
@@ -156,6 +157,21 @@ ncchkio_put_att(void         *ncdp,
     err = ncchkp->driver->put_att(ncchkp->ncp, varid, name, xtype, nelems, buf,
                                itype);
     if (err != NC_NOERR) return err;
+
+#ifdef ENABLE_IPCOMP
+    if (name != NULL && varid >= 0 && varid < ncchkp->vars.cnt) {
+        NC_chk_var *varp = ncchkp->vars.data + varid;
+        if (strcmp(name, "comp:interp_dim_limit") == 0 &&
+            xtype == NC_INT && nelems == 1 && buf != NULL) {
+            int v = *((const int *)buf);
+            if (v > 0) {
+                if (v & 1) v--;   /* must be even */
+                if (v < 2) v = 2; /* avoid degenerate */
+                varp->ipcomp_interp_dim_limit = (size_t)v;
+            }
+        }
+    }
+#endif
 
     return NC_NOERR;
 }

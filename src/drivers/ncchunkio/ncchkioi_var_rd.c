@@ -149,11 +149,18 @@ int ncchkioi_load_var (NC_chk *ncchkp, NC_chk_var *varp, int nchunk, int *cids) 
 		ctx.zlib_level = varp->zlib_level;
 		ctx.varid = varp->varid;
 #ifdef ENABLE_IPCOMP
+	ctx.ipcomp_put_att = ncchkp->driver->put_att;
+	ctx.ipcomp_get_att = ncchkp->driver->get_att;
+	ctx.ipcomp_ncp     = ncchkp->ncp;
+	ctx.ipcomp_varid   = varp->varid;
+#endif
+#ifdef ENABLE_IPCOMP
 		ctx.ipcomp_layers = varp->ipcomp_layers;
 		ctx.ipcomp_interp = varp->ipcomp_interp;
 		ctx.ipcomp_direction = varp->ipcomp_direction;
 		ctx.ipcomp_level_progressive = varp->ipcomp_level_progressive;
 		ctx.ipcomp_block_size = varp->ipcomp_block_size;
+		ctx.ipcomp_interp_dim_limit = varp->ipcomp_interp_dim_limit;
 		ctx.ipcomp_ebs = varp->ipcomp_ebs;
 		ctx.ipcomp_num_ebs = varp->ipcomp_num_ebs;
 		ctx.ipcomp_data_range = varp->ipcomp_data_range;
@@ -357,6 +364,7 @@ int ncchkioi_load_nvar (NC_chk *ncchkp, int nvar, int *varids, int *lo, int *hi)
 							ctx.ipcomp_direction = varp->ipcomp_direction;
 							ctx.ipcomp_level_progressive = varp->ipcomp_level_progressive;
 							ctx.ipcomp_block_size = varp->ipcomp_block_size;
+							ctx.ipcomp_interp_dim_limit = varp->ipcomp_interp_dim_limit;
 							ctx.ipcomp_ebs = varp->ipcomp_ebs;
 							ctx.ipcomp_num_ebs = varp->ipcomp_num_ebs;
 							ctx.ipcomp_data_range = varp->ipcomp_data_range;
@@ -582,6 +590,7 @@ int ncchkioi_load_var_bg (NC_chk *ncchkp, NC_chk_var *varp, int nchunk, int *cid
 		ctx.ipcomp_direction = varp->ipcomp_direction;
 		ctx.ipcomp_level_progressive = varp->ipcomp_level_progressive;
 		ctx.ipcomp_block_size = varp->ipcomp_block_size;
+		ctx.ipcomp_interp_dim_limit = varp->ipcomp_interp_dim_limit;
 		ctx.ipcomp_ebs = varp->ipcomp_ebs;
 		ctx.ipcomp_num_ebs = varp->ipcomp_num_ebs;
 		ctx.ipcomp_data_range = varp->ipcomp_data_range;
@@ -765,6 +774,7 @@ int ncchkioi_load_nvar_bg (NC_chk *ncchkp, int nvar, int *varids, int *lo, int *
 							ctx.ipcomp_direction = varp->ipcomp_direction;
 							ctx.ipcomp_level_progressive = varp->ipcomp_level_progressive;
 							ctx.ipcomp_block_size = varp->ipcomp_block_size;
+							ctx.ipcomp_interp_dim_limit = varp->ipcomp_interp_dim_limit;
 							ctx.ipcomp_ebs = varp->ipcomp_ebs;
 							ctx.ipcomp_num_ebs = varp->ipcomp_num_ebs;
 							ctx.ipcomp_data_range = varp->ipcomp_data_range;

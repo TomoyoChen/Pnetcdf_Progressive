@@ -213,6 +213,7 @@ int ncchkioi_var_init_core (
 					varp->ipcomp_direction = 0;
 					varp->ipcomp_level_progressive = 0;
 					varp->ipcomp_block_size = IPCOMP_DEFAULT_BLOCK_SIZE;
+					varp->ipcomp_interp_dim_limit = IPCOMP_DEFAULT_INTERP_DIM_LIMIT;
 					varp->ipcomp_data_range = 0.0;
 					if (varp->ipcomp_ebs != NULL) {
 						NCI_Free (varp->ipcomp_ebs);
@@ -237,6 +238,18 @@ int ncchkioi_var_init_core (
 						ret = ncchkp->driver->get_att (ncchkp->ncp, varp->varid, "comp:block_size", &attr_int, MPI_INT);
 						if (ret == NC_NOERR && attr_int > 0) {
 							varp->ipcomp_block_size = (size_t)attr_int;
+						}
+					}
+
+					/* comp:interp_dim_limit (even) */
+					ret = ncchkp->driver->inq_att (ncchkp->ncp, varp->varid, "comp:interp_dim_limit", NULL, &attr_len);
+					if (ret == NC_NOERR && attr_len == 1) {
+						ret = ncchkp->driver->get_att (ncchkp->ncp, varp->varid, "comp:interp_dim_limit", &attr_int, MPI_INT);
+						if (ret == NC_NOERR && attr_int > 0) {
+							int v = attr_int;
+							if (v & 1) v--;               /* make even */
+							if (v < 2) v = 2;             /* avoid degenerate */
+							varp->ipcomp_interp_dim_limit = (size_t)v;
 						}
 					}
 

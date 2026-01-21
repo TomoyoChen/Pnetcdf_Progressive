@@ -31,10 +31,40 @@
 #include <cstdio>
 #include <unistd.h>
 #include <mpi.h>  // 用于计时
+#include <cstdarg>
+
+/* Some toolchains/language servers may not see ALWAYS_INLINE from SZ3 headers.
+ * Define it locally if missing. */
+#ifndef ALWAYS_INLINE
+#if defined(_MSC_VER)
+#define ALWAYS_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#define ALWAYS_INLINE inline
+#endif
+#endif
 
 /* Data type constants */
 #define IPCOMP_FLOAT  0
 #define IPCOMP_DOUBLE 1
+
+static inline bool ipcomp_wrapper_debug_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* v = std::getenv("IPCOMP_WRAPPER_DEBUG");
+        enabled = (v && *v) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static inline void ipcomp_wrapper_dbg(const char* fmt, ...) {
+    if (!ipcomp_wrapper_debug_enabled()) return;
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
 
 /* IPComp wrapper structure */
 struct IPCompWrapper {
@@ -44,6 +74,7 @@ struct IPCompWrapper {
     int direction_op;
     int layers;
     size_t block_size;
+    size_t interp_dim_limit;
     int level_progressive;
     void* compressor;  /* Will hold the actual SZ3 compressor */
     int data_type;
@@ -52,6 +83,12 @@ struct IPCompWrapper {
     double meta_min;
     double meta_max;
     bool has_meta_minmax;
+    std::vector<unsigned char> mask_valid;
+    std::vector<unsigned char> mask_boundary;
+    size_t mask_bytes;
+    size_t mask_valid_count;
+    int guard_radius;
+    bool mask_set;
 };
 
 static std::vector<double> build_default_relative_ebs(int layers) {
@@ -329,7 +366,7 @@ extern "C" {
 #ifdef ENABLE_IPCOMP
 /* Create IPComp compressor instance */
 void* ipcomp_create_compressor(int ndim, const int* dims, int interp_op, int direction_op, 
-                              int layers, size_t block_size, int level_progressive) {
+                              int layers, size_t interp_dim_limit, size_t block_size, int level_progressive) {
     try {
         IPCompWrapper* wrapper = new IPCompWrapper();
         wrapper->ndim = ndim;
@@ -338,6 +375,10 @@ void* ipcomp_create_compressor(int ndim, const int* dims, int interp_op, int dir
         wrapper->direction_op = direction_op;
         wrapper->layers = layers;
         wrapper->block_size = block_size;
+        /* interp_dim_limit must be even; keep it safe here as a last line of defense */
+        if (interp_dim_limit & 1u) interp_dim_limit--;
+        if (interp_dim_limit < 2) interp_dim_limit = 2;
+        wrapper->interp_dim_limit = interp_dim_limit;
         wrapper->level_progressive = level_progressive;
         wrapper->compressor = nullptr;
         wrapper->data_type = -1;
@@ -345,6 +386,12 @@ void* ipcomp_create_compressor(int ndim, const int* dims, int interp_op, int dir
         wrapper->meta_min = 0.0;
         wrapper->meta_max = 0.0;
         wrapper->has_meta_minmax = false;
+        wrapper->mask_bytes = 0;
+        wrapper->mask_valid_count = 0;
+        wrapper->guard_radius = 0;
+        wrapper->mask_set = false;
+        wrapper->mask_valid.clear();
+        wrapper->mask_boundary.clear();
         
         /* Calculate total number of elements */
         wrapper->num_elements = 1;
@@ -479,10 +526,17 @@ unsigned char* ipcomp_compress(void* compressor, const void* data, int data_type
                     sz_dims,
                     wrapper->interp_op,
                     wrapper->direction_op,
-                    wrapper->block_size,
+                    wrapper->interp_dim_limit,
                     wrapper->layers,
-                    wrapper->level_progressive
+                    wrapper->block_size
                 );
+                if (wrapper->mask_set && wrapper->mask_bytes > 0) {
+                    sz_comp.set_mask(wrapper->mask_valid.data(),
+                                     wrapper->mask_boundary.empty() ? nullptr : wrapper->mask_boundary.data(),
+                                     wrapper->mask_bytes,
+                                     wrapper->mask_valid_count,
+                                     wrapper->guard_radius);
+                }
                 
                 t1 = MPI_Wtime();
                 t_create_comp = t1 - t0;
@@ -578,10 +632,17 @@ unsigned char* ipcomp_compress(void* compressor, const void* data, int data_type
                     sz_dims,
                     wrapper->interp_op,
                     wrapper->direction_op,
-                    wrapper->block_size,
+                    wrapper->interp_dim_limit,
                     wrapper->layers,
-                    wrapper->level_progressive
+                    wrapper->block_size
                 );
+                if (wrapper->mask_set && wrapper->mask_bytes > 0) {
+                    sz_comp.set_mask(wrapper->mask_valid.data(),
+                                     wrapper->mask_boundary.empty() ? nullptr : wrapper->mask_boundary.data(),
+                                     wrapper->mask_bytes,
+                                     wrapper->mask_valid_count,
+                                     wrapper->guard_radius);
+                }
 
                 sz_comp.setupLayers(float_copy);  // 使用副本，这会计算 range
                 
@@ -664,10 +725,17 @@ unsigned char* ipcomp_compress(void* compressor, const void* data, int data_type
                     sz_dims,
                     wrapper->interp_op,
                     wrapper->direction_op,
-                    wrapper->block_size,
+                    wrapper->interp_dim_limit,
                     wrapper->layers,
-                    wrapper->level_progressive
+                    wrapper->block_size
                 );
+                if (wrapper->mask_set && wrapper->mask_bytes > 0) {
+                    sz_comp.set_mask(wrapper->mask_valid.data(),
+                                     wrapper->mask_boundary.empty() ? nullptr : wrapper->mask_boundary.data(),
+                                     wrapper->mask_bytes,
+                                     wrapper->mask_valid_count,
+                                     wrapper->guard_radius);
+                }
 
                 sz_comp.setupLayers(double_copy);  // 使用副本
                 result = sz_comp.compress(double_copy,  // 使用副本
@@ -690,10 +758,17 @@ unsigned char* ipcomp_compress(void* compressor, const void* data, int data_type
                     sz_dims,
                     wrapper->interp_op,
                     wrapper->direction_op,
-                    wrapper->block_size,
+                    wrapper->interp_dim_limit,
                     wrapper->layers,
-                    wrapper->level_progressive
+                    wrapper->block_size
                 );
+                if (wrapper->mask_set && wrapper->mask_bytes > 0) {
+                    sz_comp.set_mask(wrapper->mask_valid.data(),
+                                     wrapper->mask_boundary.empty() ? nullptr : wrapper->mask_boundary.data(),
+                                     wrapper->mask_bytes,
+                                     wrapper->mask_valid_count,
+                                     wrapper->guard_radius);
+                }
                 
                 t1 = MPI_Wtime();
                 t_create_comp = t1 - t0;
@@ -942,9 +1017,17 @@ void* ipcomp_decompress_error(void* compressor, const unsigned char* compressed_
                     sz_dims,
                     wrapper->interp_op,
                     wrapper->direction_op,
-                    wrapper->block_size,
+                    wrapper->interp_dim_limit,
                     wrapper->layers,
-                    wrapper->level_progressive);
+                    wrapper->block_size);
+
+                if (wrapper->mask_set && wrapper->mask_bytes > 0) {
+                    sz_comp.set_mask(wrapper->mask_valid.data(),
+                                     wrapper->mask_boundary.empty() ? nullptr : wrapper->mask_boundary.data(),
+                                     wrapper->mask_bytes,
+                                     wrapper->mask_valid_count,
+                                     wrapper->guard_radius);
+                }
 
                 if (wrapper->data_range > 0.0 && wrapper->num_elements > 0) {
                     dummy_original[0] = static_cast<float>(wrapper->data_range);
@@ -973,9 +1056,20 @@ void* ipcomp_decompress_error(void* compressor, const unsigned char* compressed_
                     sz_dims,
                     wrapper->interp_op,
                     wrapper->direction_op,
-                    wrapper->block_size,
+                    wrapper->interp_dim_limit,
                     wrapper->layers,
-                    wrapper->level_progressive);
+                    wrapper->block_size);
+
+                if (wrapper->mask_set && wrapper->mask_bytes > 0) {
+                    sz_comp.set_mask(wrapper->mask_valid.data(),
+                                     wrapper->mask_boundary.empty() ? nullptr : wrapper->mask_boundary.data(),
+                                     wrapper->mask_bytes,
+                                     wrapper->mask_valid_count,
+                                     wrapper->guard_radius);
+                }
+                ipcomp_wrapper_dbg("[IPCOMP_WRAPPER][decomp_error][3D][float] mask_set=%d mask_bytes=%zu valid_count=%zu guard=%d boundary=%s\n",
+                                   (int)wrapper->mask_set, wrapper->mask_bytes, wrapper->mask_valid_count,
+                                   wrapper->guard_radius, wrapper->mask_boundary.empty() ? "no" : "yes");
 
                 if (wrapper->data_range > 0.0 && wrapper->num_elements > 0) {
                     dummy_original[0] = static_cast<float>(wrapper->data_range);
@@ -1034,9 +1128,33 @@ void* ipcomp_decompress_error(void* compressor, const unsigned char* compressed_
                     sz_dims,
                     wrapper->interp_op,
                     wrapper->direction_op,
-                    wrapper->block_size,
+                    wrapper->interp_dim_limit,
                     wrapper->layers,
-                    wrapper->level_progressive);
+                    wrapper->block_size);
+
+                if (wrapper->mask_set && wrapper->mask_bytes > 0) {
+                    sz_comp.set_mask(wrapper->mask_valid.data(),
+                                     wrapper->mask_boundary.empty() ? nullptr : wrapper->mask_boundary.data(),
+                                     wrapper->mask_bytes,
+                                     wrapper->mask_valid_count,
+                                     wrapper->guard_radius);
+                }
+
+                if (wrapper->mask_set && wrapper->mask_bytes > 0) {
+                    sz_comp.set_mask(wrapper->mask_valid.data(),
+                                     wrapper->mask_boundary.empty() ? nullptr : wrapper->mask_boundary.data(),
+                                     wrapper->mask_bytes,
+                                     wrapper->mask_valid_count,
+                                     wrapper->guard_radius);
+                }
+
+                if (wrapper->mask_set && wrapper->mask_bytes > 0) {
+                    sz_comp.set_mask(wrapper->mask_valid.data(),
+                                     wrapper->mask_boundary.empty() ? nullptr : wrapper->mask_boundary.data(),
+                                     wrapper->mask_bytes,
+                                     wrapper->mask_valid_count,
+                                     wrapper->guard_radius);
+                }
 
                 if (wrapper->data_range > 0.0 && wrapper->num_elements > 0) {
                     dummy_original[0] = wrapper->data_range;
@@ -1065,9 +1183,28 @@ void* ipcomp_decompress_error(void* compressor, const unsigned char* compressed_
                     sz_dims,
                     wrapper->interp_op,
                     wrapper->direction_op,
-                    wrapper->block_size,
+                    wrapper->interp_dim_limit,
                     wrapper->layers,
-                    wrapper->level_progressive);
+                    wrapper->block_size);
+
+                if (wrapper->mask_set && wrapper->mask_bytes > 0) {
+                    sz_comp.set_mask(wrapper->mask_valid.data(),
+                                     wrapper->mask_boundary.empty() ? nullptr : wrapper->mask_boundary.data(),
+                                     wrapper->mask_bytes,
+                                     wrapper->mask_valid_count,
+                                     wrapper->guard_radius);
+                }
+
+                if (wrapper->mask_set && wrapper->mask_bytes > 0) {
+                    sz_comp.set_mask(wrapper->mask_valid.data(),
+                                     wrapper->mask_boundary.empty() ? nullptr : wrapper->mask_boundary.data(),
+                                     wrapper->mask_bytes,
+                                     wrapper->mask_valid_count,
+                                     wrapper->guard_radius);
+                }
+                ipcomp_wrapper_dbg("[IPCOMP_WRAPPER][decomp_error][3D][double] mask_set=%d mask_bytes=%zu valid_count=%zu guard=%d boundary=%s\n",
+                                   (int)wrapper->mask_set, wrapper->mask_bytes, wrapper->mask_valid_count,
+                                   wrapper->guard_radius, wrapper->mask_boundary.empty() ? "no" : "yes");
 
                 if (wrapper->data_range > 0.0 && wrapper->num_elements > 0) {
                     dummy_original[0] = wrapper->data_range;
@@ -1208,9 +1345,9 @@ void* ipcomp_decompress_bitrate(void* compressor, const unsigned char* compresse
                     sz_dims,
                     wrapper->interp_op,
                     wrapper->direction_op,
-                    wrapper->block_size,
+                    wrapper->interp_dim_limit,
                     wrapper->layers,
-                    wrapper->level_progressive);
+                    wrapper->block_size);
 
                 if (wrapper->data_range > 0.0 && wrapper->num_elements > 0) {
                     dummy_original[0] = static_cast<float>(wrapper->data_range);
@@ -1235,9 +1372,17 @@ void* ipcomp_decompress_bitrate(void* compressor, const unsigned char* compresse
                     sz_dims,
                     wrapper->interp_op,
                     wrapper->direction_op,
-                    wrapper->block_size,
+                    wrapper->interp_dim_limit,
                     wrapper->layers,
-                    wrapper->level_progressive);
+                    wrapper->block_size);
+
+                if (wrapper->mask_set && wrapper->mask_bytes > 0) {
+                    sz_comp.set_mask(wrapper->mask_valid.data(),
+                                     wrapper->mask_boundary.empty() ? nullptr : wrapper->mask_boundary.data(),
+                                     wrapper->mask_bytes,
+                                     wrapper->mask_valid_count,
+                                     wrapper->guard_radius);
+                }
 
                 if (wrapper->data_range > 0.0 && wrapper->num_elements > 0) {
                     dummy_original[0] = static_cast<float>(wrapper->data_range);
@@ -1294,9 +1439,9 @@ void* ipcomp_decompress_bitrate(void* compressor, const unsigned char* compresse
                     sz_dims,
                     wrapper->interp_op,
                     wrapper->direction_op,
-                    wrapper->block_size,
+                    wrapper->interp_dim_limit,
                     wrapper->layers,
-                    wrapper->level_progressive);
+                    wrapper->block_size);
 
                 if (wrapper->data_range > 0.0 && wrapper->num_elements > 0) {
                     dummy_original[0] = wrapper->data_range;
@@ -1321,9 +1466,17 @@ void* ipcomp_decompress_bitrate(void* compressor, const unsigned char* compresse
                     sz_dims,
                     wrapper->interp_op,
                     wrapper->direction_op,
-                    wrapper->block_size,
+                    wrapper->interp_dim_limit,
                     wrapper->layers,
-                    wrapper->level_progressive);
+                    wrapper->block_size);
+
+                if (wrapper->mask_set && wrapper->mask_bytes > 0) {
+                    sz_comp.set_mask(wrapper->mask_valid.data(),
+                                     wrapper->mask_boundary.empty() ? nullptr : wrapper->mask_boundary.data(),
+                                     wrapper->mask_bytes,
+                                     wrapper->mask_valid_count,
+                                     wrapper->guard_radius);
+                }
 
                 if (wrapper->data_range > 0.0 && wrapper->num_elements > 0) {
                     dummy_original[0] = wrapper->data_range;
@@ -1404,11 +1557,48 @@ int ipcomp_set_minmax(void* compressor, double data_min, double data_max) {
     return 0;
 }
 
+int ipcomp_set_mask(void* compressor,
+                    const unsigned char* valid_mask,
+                    const unsigned char* boundary_mask,
+                    size_t mask_bytes,
+                    size_t valid_count,
+                    int guard_radius) {
+    if (compressor == nullptr) return -1;
+    IPCompWrapper* wrapper = static_cast<IPCompWrapper*>(compressor);
+    if (!valid_mask || mask_bytes == 0) {
+        wrapper->mask_valid.clear();
+        wrapper->mask_boundary.clear();
+        wrapper->mask_bytes = 0;
+        wrapper->mask_valid_count = 0;
+        wrapper->guard_radius = 0;
+        wrapper->mask_set = false;
+        return 0;
+    }
+    try {
+        wrapper->mask_valid.assign(valid_mask, valid_mask + mask_bytes);
+        if (boundary_mask) {
+            wrapper->mask_boundary.assign(boundary_mask, boundary_mask + mask_bytes);
+        } else {
+            wrapper->mask_boundary.clear();
+        }
+        wrapper->mask_bytes = mask_bytes;
+        wrapper->mask_valid_count = valid_count;
+        wrapper->guard_radius = guard_radius;
+        wrapper->mask_set = true;
+        ipcomp_wrapper_dbg("[IPCOMP_WRAPPER][set_mask] bytes=%zu valid_count=%zu guard=%d boundary=%s\n",
+                           wrapper->mask_bytes, wrapper->mask_valid_count, wrapper->guard_radius,
+                           wrapper->mask_boundary.empty() ? "no" : "yes");
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
 #else /* !ENABLE_IPCOMP */
 
 /* Stub implementations when IPComp is disabled */
 void* ipcomp_create_compressor(int ndim, const int* dims, int interp_op, int direction_op, 
-                              int layers, size_t block_size, int level_progressive) {
+                              int layers, size_t interp_dim_limit, size_t block_size, int level_progressive) {
     return nullptr;
 }
 
@@ -1420,7 +1610,8 @@ int ipcomp_setup_layers(void* compressor, const void* data, int data_type) {
     return -1;
 }
 
-unsigned char* ipcomp_compress(void* compressor, const void* data, int data_type, size_t* compressed_size) {
+unsigned char* ipcomp_compress(void* compressor, const void* data, int data_type, size_t* compressed_size,
+                               int ndim, const int* dims) {
     return nullptr;
 }
 
@@ -1445,6 +1636,15 @@ int ipcomp_set_range(void* compressor, double data_range) {
 }
 
 int ipcomp_set_minmax(void* compressor, double data_min, double data_max) {
+    return -1;
+}
+
+int ipcomp_set_mask(void* compressor,
+                    const unsigned char* valid_mask,
+                    const unsigned char* boundary_mask,
+                    size_t mask_bytes,
+                    size_t valid_count,
+                    int guard_radius) {
     return -1;
 }
 
