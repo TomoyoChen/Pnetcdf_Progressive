@@ -66,6 +66,9 @@ static inline void ipcomp_wrapper_dbg(const char* fmt, ...) {
     va_end(ap);
 }
 
+static double g_ipcomp_core_compress_time = 0.0;
+static double g_ipcomp_core_decompress_time = 0.0;
+
 /* IPComp wrapper structure */
 struct IPCompWrapper {
     int ndim;
@@ -364,6 +367,21 @@ auto with_verification_override(IPCompWrapper* wrapper, Callable&& fn)
 extern "C" {
 
 #ifdef ENABLE_IPCOMP
+double ipcomp_get_core_compress_time(void) {
+    return g_ipcomp_core_compress_time;
+}
+
+double ipcomp_get_core_decompress_time(void) {
+    return g_ipcomp_core_decompress_time;
+}
+
+void ipcomp_reset_core_timers(void) {
+    g_ipcomp_core_compress_time = 0.0;
+    g_ipcomp_core_decompress_time = 0.0;
+}
+#endif
+
+#ifdef ENABLE_IPCOMP
 /* Create IPComp compressor instance */
 void* ipcomp_create_compressor(int ndim, const int* dims, int interp_op, int direction_op, 
                               int layers, size_t interp_dim_limit, size_t block_size, int level_progressive) {
@@ -607,9 +625,12 @@ unsigned char* ipcomp_compress(void* compressor, const void* data, int data_type
                 
                 // Timer: 核心压缩
                 t0 = MPI_Wtime();
+                double t_core_start = MPI_Wtime();
                 result = sz_comp.compress(float_copy,  // 使用副本，IPComp可以安全修改
                                           *compressed_size,
                                           lossless_buffer);
+                double t_core_end = MPI_Wtime();
+                g_ipcomp_core_compress_time += (t_core_end - t_core_start);
                 t1 = MPI_Wtime();
                 t_compress_core = t1 - t0;
                 
@@ -654,9 +675,12 @@ unsigned char* ipcomp_compress(void* compressor, const void* data, int data_type
                 }
                 wrapper->data_range = static_cast<double>(max_val - min_val);
                 
+                double t_core_start = MPI_Wtime();
                 result = sz_comp.compress(float_copy,  // 使用副本
                                           *compressed_size,
                                           lossless_buffer);
+                double t_core_end = MPI_Wtime();
+                g_ipcomp_core_compress_time += (t_core_end - t_core_start);
             } else {
                 delete[] float_copy; free(lossless_buffer); *compressed_size = 0; return nullptr;
             }
@@ -738,9 +762,12 @@ unsigned char* ipcomp_compress(void* compressor, const void* data, int data_type
                 }
 
                 sz_comp.setupLayers(double_copy);  // 使用副本
+                double t_core_start = MPI_Wtime();
                 result = sz_comp.compress(double_copy,  // 使用副本
                                           *compressed_size,
                                           lossless_buffer);
+                double t_core_end = MPI_Wtime();
+                g_ipcomp_core_compress_time += (t_core_end - t_core_start);
 
             } else if (ndim == 3) {
                 // 使用实际传入的dims创建3D维度数组
@@ -794,9 +821,12 @@ unsigned char* ipcomp_compress(void* compressor, const void* data, int data_type
                 
                 // Timer: SZ3核心压缩
                 t0 = MPI_Wtime();
+                double t_core_start = MPI_Wtime();
                 result = sz_comp.compress(double_copy,  // 使用副本
                                           *compressed_size,
                                           lossless_buffer);
+                double t_core_end = MPI_Wtime();
+                g_ipcomp_core_compress_time += (t_core_end - t_core_start);
                 t1 = MPI_Wtime();
                 t_compress_core = t1 - t0;
             } else {
@@ -1039,10 +1069,18 @@ void* ipcomp_decompress_error(void* compressor, const unsigned char* compressed_
 
                 fprintf(stderr, "[DEBUG] ipcomp_decompress_error float: layers=%d, rel_ebs count=%zu first=%g\n",
                         wrapper->layers, relative_ebs.size(), relative_ebs.empty() ? 0.0 : relative_ebs.front());
+                double t_core_start = 0.0;
+                double t_core_end = 0.0;
                 result = with_verification_override(wrapper, [&]() {
-                    return sz_comp.decompress(const_cast<unsigned char*>(payload),
-                                              dummy_original, relative_ebs);
+                    t_core_start = MPI_Wtime();
+                    auto res = sz_comp.decompress(const_cast<unsigned char*>(payload),
+                                                  dummy_original, relative_ebs);
+                    t_core_end = MPI_Wtime();
+                    return res;
                 });
+                if (t_core_end > t_core_start) {
+                    g_ipcomp_core_decompress_time += (t_core_end - t_core_start);
+                }
             } else if (wrapper->ndim == 3) {
                 std::array<size_t, 3> sz_dims{static_cast<size_t>(wrapper->dims[0]),
                                               static_cast<size_t>(wrapper->dims[1]),
@@ -1081,10 +1119,18 @@ void* ipcomp_decompress_error(void* compressor, const unsigned char* compressed_
 
                 fprintf(stderr, "[DEBUG] ipcomp_decompress_error float 3D: layers=%d, rel_ebs count=%zu first=%g\n",
                         wrapper->layers, relative_ebs.size(), relative_ebs.empty() ? 0.0 : relative_ebs.front());
+                double t_core_start = 0.0;
+                double t_core_end = 0.0;
                 result = with_verification_override(wrapper, [&]() {
-                    return sz_comp.decompress(const_cast<unsigned char*>(payload),
-                                              dummy_original, relative_ebs);
+                    t_core_start = MPI_Wtime();
+                    auto res = sz_comp.decompress(const_cast<unsigned char*>(payload),
+                                                  dummy_original, relative_ebs);
+                    t_core_end = MPI_Wtime();
+                    return res;
                 });
+                if (t_core_end > t_core_start) {
+                    g_ipcomp_core_decompress_time += (t_core_end - t_core_start);
+                }
             } else {
                 delete[] dummy_original;
                 return nullptr;
@@ -1166,10 +1212,18 @@ void* ipcomp_decompress_error(void* compressor, const unsigned char* compressed_
 
                 fprintf(stderr, "[DEBUG] ipcomp_decompress_error double: layers=%d, rel_ebs count=%zu first=%g\n",
                         wrapper->layers, relative_ebs.size(), relative_ebs.empty() ? 0.0 : relative_ebs.front());
+                double t_core_start = 0.0;
+                double t_core_end = 0.0;
                 result = with_verification_override(wrapper, [&]() {
-                    return sz_comp.decompress(const_cast<unsigned char*>(payload),
-                                              dummy_original, relative_ebs);
+                    t_core_start = MPI_Wtime();
+                    auto res = sz_comp.decompress(const_cast<unsigned char*>(payload),
+                                                  dummy_original, relative_ebs);
+                    t_core_end = MPI_Wtime();
+                    return res;
                 });
+                if (t_core_end > t_core_start) {
+                    g_ipcomp_core_decompress_time += (t_core_end - t_core_start);
+                }
             } else if (wrapper->ndim == 3) {
                 std::array<size_t, 3> sz_dims{static_cast<size_t>(wrapper->dims[0]),
                                               static_cast<size_t>(wrapper->dims[1]),
@@ -1216,10 +1270,18 @@ void* ipcomp_decompress_error(void* compressor, const unsigned char* compressed_
 
                 fprintf(stderr, "[DEBUG] ipcomp_decompress_error double 3D: layers=%d, rel_ebs count=%zu first=%g\n",
                         wrapper->layers, relative_ebs.size(), relative_ebs.empty() ? 0.0 : relative_ebs.front());
+                double t_core_start = 0.0;
+                double t_core_end = 0.0;
                 result = with_verification_override(wrapper, [&]() {
-                    return sz_comp.decompress(const_cast<unsigned char*>(payload),
-                                              dummy_original, relative_ebs);
+                    t_core_start = MPI_Wtime();
+                    auto res = sz_comp.decompress(const_cast<unsigned char*>(payload),
+                                                  dummy_original, relative_ebs);
+                    t_core_end = MPI_Wtime();
+                    return res;
                 });
+                if (t_core_end > t_core_start) {
+                    g_ipcomp_core_decompress_time += (t_core_end - t_core_start);
+                }
             } else {
                 delete[] dummy_original;
                 return nullptr;
@@ -1357,8 +1419,13 @@ void* ipcomp_decompress_bitrate(void* compressor, const unsigned char* compresse
                     dummy_original[i] = 0.0f;
                 }
 
+                double t_core_start = MPI_Wtime();
                 result = sz_comp.decompress_bitrate(const_cast<unsigned char*>(payload),
                                                     dummy_original, bitrate_targets);
+                double t_core_end = MPI_Wtime();
+                if (t_core_end > t_core_start) {
+                    g_ipcomp_core_decompress_time += (t_core_end - t_core_start);
+                }
             } else if (wrapper->ndim == 3) {
                 std::array<size_t, 3> sz_dims{static_cast<size_t>(wrapper->dims[0]),
                                               static_cast<size_t>(wrapper->dims[1]),
@@ -1392,8 +1459,13 @@ void* ipcomp_decompress_bitrate(void* compressor, const unsigned char* compresse
                     dummy_original[i] = 0.0f;
                 }
 
+                double t_core_start = MPI_Wtime();
                 result = sz_comp.decompress_bitrate(const_cast<unsigned char*>(payload),
                                                     dummy_original, bitrate_targets);
+                double t_core_end = MPI_Wtime();
+                if (t_core_end > t_core_start) {
+                    g_ipcomp_core_decompress_time += (t_core_end - t_core_start);
+                }
             } else {
                 delete[] dummy_original;
                 return nullptr;
@@ -1451,8 +1523,13 @@ void* ipcomp_decompress_bitrate(void* compressor, const unsigned char* compresse
                     dummy_original[i] = 0.0;
                 }
 
+                double t_core_start = MPI_Wtime();
                 result = sz_comp.decompress_bitrate(const_cast<unsigned char*>(payload),
                                                     dummy_original, bitrate_targets);
+                double t_core_end = MPI_Wtime();
+                if (t_core_end > t_core_start) {
+                    g_ipcomp_core_decompress_time += (t_core_end - t_core_start);
+                }
             } else if (wrapper->ndim == 3) {
                 std::array<size_t, 3> sz_dims{static_cast<size_t>(wrapper->dims[0]),
                                               static_cast<size_t>(wrapper->dims[1]),
@@ -1486,8 +1563,13 @@ void* ipcomp_decompress_bitrate(void* compressor, const unsigned char* compresse
                     dummy_original[i] = 0.0;
                 }
 
+                double t_core_start = MPI_Wtime();
                 result = sz_comp.decompress_bitrate(const_cast<unsigned char*>(payload),
                                                     dummy_original, bitrate_targets);
+                double t_core_end = MPI_Wtime();
+                if (t_core_end > t_core_start) {
+                    g_ipcomp_core_decompress_time += (t_core_end - t_core_start);
+                }
             } else {
                 delete[] dummy_original;
                 return nullptr;

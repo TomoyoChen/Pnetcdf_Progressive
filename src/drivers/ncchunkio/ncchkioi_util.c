@@ -112,6 +112,17 @@ int ncchkioi_extract_hint (NC_chk *ncchkp, MPI_Info info) {
 		if (strcmp (value, "1") == 0) { ncchkp->delay_init = 1; }
 	}
 
+	// Owner-only independent get (no inter-process messaging)
+	ncchkp->indep_owner_get = 0;
+	MPI_Info_get (info, "nc_chk_indep_owner_get", MPI_MAX_INFO_VAL - 1, value, &flag);
+	if (flag) {
+		if (atoi(value) != 0) { ncchkp->indep_owner_get = 1; }
+	}
+	if (ncchkp->indep_owner_get && ncchkp->delay_init) {
+		/* independent owner-only get needs metadata ready at open */
+		ncchkp->delay_init = 0;
+	}
+
 	// Exact chunk owner assignment
 	ncchkp->exact_cown = 0;
 	MPI_Info_get (info, "nc_chk_exact_cown", MPI_MAX_INFO_VAL - 1, value, &flag);

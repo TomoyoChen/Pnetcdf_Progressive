@@ -133,7 +133,13 @@ int ncchkioi_get_var_cb_chunk (NC_chk *ncchkp,
 		if (rcnt_all[cid] || rcnt_local[cid]) {
 			if (varp->chunk_cache[cid] == NULL) {
 				// err = ncchkioi_cache_alloc(ncchkp, varp->chunksize, varp->chunk_cache + cid);
-				if (varp->chunk_index[cid].len > 0) { rids[nread++] = cid; }
+				if (varp->chunk_index[cid].len > 0) {
+					rids[nread++] = cid;
+				} else {
+					err = ncchkioi_cache_alloc(ncchkp, varp->chunksize, varp->chunk_cache + cid);
+					CHK_ERR
+					memset(varp->chunk_cache[cid]->buf, 0, varp->chunksize);
+				}
 			} else {
 				// ncchkioi_cache_visit(ncchkp, varp->chunk_cache[cid]);
 			}
@@ -457,6 +463,111 @@ err_out:;
 	return err;
 }
 
+int ncchkioi_get_var_owner_indep (NC_chk *ncchkp,
+								  NC_chk_var *varp,
+								  const MPI_Offset *start,
+								  const MPI_Offset *count,
+								  const MPI_Offset *stride,
+								  void *buf) {
+	int err=NC_NOERR;
+	int i, j;
+	int cid;
+	int has_elements = 1;
+	int nread = 0;
+	int *rids = NULL;
+	int *tsize = NULL, *tssize, *tstart;
+	MPI_Offset *ostart = NULL, *osize, *citr;
+	char *tbuf = NULL;
+	int packoff;
+	int overlapsize;
+	MPI_Datatype ptype;
+
+	(void)stride;
+
+	for (i = 0; i < varp->ndim; i++) {
+		if (count[i] == 0) {
+			has_elements = 0;
+			break;
+		}
+	}
+	if (!has_elements || buf == NULL) return NC_NOERR;
+
+	tsize  = (int *)NCI_Malloc (sizeof (int) * varp->ndim * 3);
+	CHK_PTR (tsize)
+	tssize = tsize + varp->ndim;
+	tstart = tssize + varp->ndim;
+	ostart = (MPI_Offset *)NCI_Malloc (sizeof (MPI_Offset) * varp->ndim * 3);
+	CHK_PTR (ostart)
+	osize  = ostart + varp->ndim;
+	citr   = osize + varp->ndim;
+
+	rids = (int *)NCI_Malloc (sizeof (int) * varp->nchunk);
+	CHK_PTR (rids)
+
+	// Prepare chunk cache for all overlapping chunks
+	ncchkioi_chunk_itr_init_ex (varp, start, count, citr, &cid, ostart, osize);
+	do {
+		if (varp->chunk_cache[cid] == NULL) {
+			if (varp->chunk_index[cid].len > 0) {
+				rids[nread++] = cid;
+			} else {
+				err = ncchkioi_cache_alloc (ncchkp, varp->chunksize, varp->chunk_cache + cid);
+				CHK_ERR
+				memset (varp->chunk_cache[cid]->buf, 0, varp->chunksize);
+			}
+		}
+	} while (ncchkioi_chunk_itr_next_ex (varp, start, count, citr, &cid, ostart, osize));
+
+	if (nread > 0) {
+		err = ncchkioi_load_var_indep (ncchkp, varp, nread, rids);
+		CHK_ERR
+		(ncchkp->cache_serial)++;
+	}
+
+	tbuf = (char *)NCI_Malloc (varp->chunksize);
+	CHK_PTR (tbuf)
+
+	// Unpack data into user buffer
+	ncchkioi_chunk_itr_init_ex (varp, start, count, citr, &cid, ostart, osize);
+	do {
+		// Pack type from chunk cache to intermediate buffer
+		for (j = 0; j < varp->ndim; j++) {
+			tstart[j] = (int)(ostart[j] - citr[j]);
+			tsize[j]  = varp->chunkdim[j];
+			tssize[j] = (int)osize[j];
+		}
+		CHK_ERR_TYPE_CREATE_SUBARRAY (varp->ndim, tsize, tssize, tstart, MPI_ORDER_C,
+									  varp->etype, &ptype);
+		CHK_ERR_TYPE_COMMIT (&ptype);
+
+		packoff = 0;
+		CHK_ERR_PACK (varp->chunk_cache[cid]->buf, 1, ptype, tbuf, varp->chunksize, &packoff,
+					  ncchkp->comm);
+		MPI_Type_free (&ptype);
+		overlapsize = packoff;
+
+		// Pack type from intermediate buffer to user buffer
+		for (j = 0; j < varp->ndim; j++) {
+			tstart[j] = (int)(ostart[j] - start[j]);
+			tsize[j]  = (int)count[j];
+		}
+		CHK_ERR_TYPE_CREATE_SUBARRAY (varp->ndim, tsize, tssize, tstart, MPI_ORDER_C,
+									  varp->etype, &ptype);
+		CHK_ERR_TYPE_COMMIT (&ptype);
+
+		packoff = 0;
+		CHK_ERR_UNPACK (tbuf, overlapsize, &packoff, buf, 1, ptype, ncchkp->comm);
+		MPI_Type_free (&ptype);
+	} while (ncchkioi_chunk_itr_next_ex (varp, start, count, citr, &cid, ostart, osize));
+
+err_out:;
+	if (rids) NCI_Free (rids);
+	if (tsize) NCI_Free (tsize);
+	if (ostart) NCI_Free (ostart);
+	if (tbuf) NCI_Free (tbuf);
+	return err;
+}
+
 int ncchkioi_get_var_cb_proc (NC_chk *ncchkp,
 							  NC_chk_var *varp,
 							  const MPI_Offset *start,
@@ -709,7 +820,13 @@ int ncchkioi_get_var_cb_proc (NC_chk *ncchkp,
 		if (varp->chunk_cache[cid] == NULL) {
 			// err = ncchkioi_cache_alloc(ncchkp, varp->chunksize, varp->chunk_cache + cid);
 			// varp->chunk_cache[cid] = (char*)NCI_Malloc(varp->chunksize);
-			if (varp->chunk_index[cid].len > 0) { rids[nread++] = cid; /* printf("chunk %d need read\n",cid); */ }
+			if (varp->chunk_index[cid].len > 0) {
+				rids[nread++] = cid; /* printf("chunk %d need read\n",cid); */
+			} else {
+				err = ncchkioi_cache_alloc(ncchkp, varp->chunksize, varp->chunk_cache + cid);
+				CHK_ERR
+				memset(varp->chunk_cache[cid]->buf, 0, varp->chunksize);
+			}
 		} else {
 			// ncchkioi_cache_visit(ncchkp, varp->chunk_cache[cid]);
 		}
@@ -811,6 +928,17 @@ int ncchkioi_get_var_cb_proc (NC_chk *ncchkp,
 			CHK_ERR_TYPE_COMMIT (&ptype);
 
 			// Data
+			if (cid < 0 || cid >= varp->nchunk || varp->chunk_cache[cid] == NULL ||
+				varp->chunk_cache[cid]->buf == NULL) {
+				fprintf(stderr,
+						"[PnetCDF][CHK] rank %d: invalid chunk cache in cb_proc (cid=%d, nchunk=%d, cache=%p, len=%d)\n",
+						ncchkp->rank, cid, varp->nchunk,
+						(cid >= 0 && cid < varp->nchunk) ? (void *)varp->chunk_cache[cid] : NULL,
+						(cid >= 0 && cid < varp->nchunk) ? varp->chunk_index[cid].len : -1);
+				MPI_Type_free (&ptype);
+				err = NC_EINVAL;
+				goto err_out;
+			}
 			CHK_ERR_PACK (varp->chunk_cache[cid]->buf, 1, ptype, sbuf_re[j], ssize_re[j], &packoff,
 						  ncchkp->comm);
 			MPI_Type_free (&ptype);

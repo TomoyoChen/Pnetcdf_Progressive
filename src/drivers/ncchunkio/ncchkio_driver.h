@@ -171,6 +171,7 @@ struct NC_chk {
 	NC_chk_req_list putlist, getlist;
 	int comm_unit;
 	int delay_init;
+	int indep_owner_get; /* owner-only independent get mode */
 	int exact_cown;
 	int max_ndim;
 	int max_chunk_size;

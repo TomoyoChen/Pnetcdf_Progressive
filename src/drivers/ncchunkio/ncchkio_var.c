@@ -248,6 +248,7 @@ int ncchkio_get_var (void *ncdp,
 	MPI_Offset nelem;
 	NC_chk_var *varp;
 	NC_chk *ncchkp = (NC_chk *)ncdp;
+	int indep_req = (reqMode & NC_REQ_INDEP);
 
 	NC_CHK_TIMER_START (NC_CHK_TIMER_TOTAL)
 	NC_CHK_TIMER_START (NC_CHK_TIMER_GET)
@@ -258,6 +259,13 @@ int ncchkio_get_var (void *ncdp,
 	if (varp->varkind == NC_CHK_VAR_RAW) {
 		return ncchkp->driver->get_var (ncchkp->ncp, varp->varid, start, count, stride, imap, buf,
 										bufcount, buftype, reqMode);
+	}
+
+	if (indep_req && !ncchkp->indep_owner_get) {
+		DEBUG_RETURN_ERROR (NC_ENOTSUPPORT);
+	}
+	if (indep_req && !NC_indep((NC *)ncchkp->ncp)) {
+		DEBUG_RETURN_ERROR (NC_ENOTINDEP);
 	}
 	
 	/* Check if count contains zero - this process has no data to read but must participate */
@@ -270,6 +278,7 @@ int ncchkio_get_var (void *ncdp,
 	}
 
 	if (ncchkp->delay_init && (varp->chunkdim == NULL)) {
+		if (indep_req) { DEBUG_RETURN_ERROR (NC_ENOTSUPPORT); }
 		NC_CHK_TIMER_PAUSE (NC_CHK_TIMER_GET)
 		NC_CHK_TIMER_START (NC_CHK_TIMER_VAR_INIT)
 		NC_CHK_TIMER_START (NC_CHK_TIMER_VAR_INIT_META)
@@ -331,14 +340,18 @@ int ncchkio_get_var (void *ncdp,
 		xbuf = NULL;
 	}
 
-	// Collective buffer - all processes must participate
-	switch (ncchkp->comm_unit) {
-		case NC_CHK_COMM_CHUNK:
-			err = ncchkioi_get_var_cb_chunk (ncchkp, varp, start, count, stride, xbuf);
-			break;
-		case NC_CHK_COMM_PROC:
-			err = ncchkioi_get_var_cb_proc (ncchkp, varp, start, count, stride, xbuf);
-			break;
+	if (indep_req) {
+		err = ncchkioi_get_var_owner_indep (ncchkp, varp, start, count, stride, xbuf);
+	} else {
+		// Collective buffer - all processes must participate
+		switch (ncchkp->comm_unit) {
+			case NC_CHK_COMM_CHUNK:
+				err = ncchkioi_get_var_cb_chunk (ncchkp, varp, start, count, stride, xbuf);
+				break;
+			case NC_CHK_COMM_PROC:
+				err = ncchkioi_get_var_cb_proc (ncchkp, varp, start, count, stride, xbuf);
+				break;
+		}
 	}
 	CHK_ERR
 

@@ -256,6 +256,7 @@ extern int ncchkioiconvert (void *, void *, MPI_Datatype, MPI_Datatype, int);
 // Var
 extern int ncchkioi_var_init (NC_chk *, NC_chk_var *, int, MPI_Offset **, MPI_Offset **);
 extern int ncchkioi_load_var (NC_chk *, NC_chk_var *, int, int *);
+extern int ncchkioi_load_var_indep (NC_chk *, NC_chk_var *, int, int *);
 extern int ncchkioi_load_var_bg (NC_chk *, NC_chk_var *, int, int *);
 extern int ncchkioi_load_nvar (NC_chk *, int, int *, int *, int *);
 extern int ncchkioi_load_nvar_bg (NC_chk *, int, int *, int *, int *);
@@ -301,6 +302,8 @@ extern int ncchkioi_chunk_itr_next_ex (NC_chk_var *,
 extern int ncchkioi_get_var_cb_chunk (
 	NC_chk *, NC_chk_var *, const MPI_Offset *, const MPI_Offset *, const MPI_Offset *, void *);
 extern int ncchkioi_get_var_cb_proc (
+	NC_chk *, NC_chk_var *, const MPI_Offset *, const MPI_Offset *, const MPI_Offset *, void *);
+extern int ncchkioi_get_var_owner_indep (
 	NC_chk *, NC_chk_var *, const MPI_Offset *, const MPI_Offset *, const MPI_Offset *, void *);
 extern int ncchkioi_get_varn (
 	NC_chk *, NC_chk_var *, int, MPI_Offset *const *, MPI_Offset *const *, const void *);
