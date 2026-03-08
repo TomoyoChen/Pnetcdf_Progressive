@@ -7,11 +7,18 @@
 #include <float.h>
 #include <math.h>
 
+#ifdef ENABLE_IPCOMP
+extern void ipcomp_reset_core_timers(void);
+extern double ipcomp_get_core_compress_time(void);
+extern unsigned long long ipcomp_get_core_compress_bytes(void);
+#endif
+
 #define CHUNK_T 1
-#define CHUNK_X 7814
 #define CHUNK_Y 8075
+#define CHUNK_X 7814
 
 #define MIN_RANGE_EPS 1e-9
+#define DEFAULT_BATCH_CHUNKS 248
 
 #define CHECK_ERR(call)                                                              \
     do {                                                                             \
@@ -39,16 +46,33 @@
 static int g_rank = 0;
 
 static int
-chunk_owner(MPI_Offset chunk_idx, int active_ranks, int chunks_per_rank, int remainder)
+owner_for_contiguous_chunk(MPI_Offset chunk_idx, int active_ranks, MPI_Offset total_chunks)
 {
-    (void)chunks_per_rank;
-    (void)remainder;
     if (active_ranks <= 0) {
         fprintf(stderr, "ERROR: active_ranks=%d is invalid!\n", active_ranks);
         return 0;
     }
-    int owner = (int)(chunk_idx % active_ranks);
-    return owner;
+
+    MPI_Offset base = total_chunks / active_ranks;
+    MPI_Offset rem = total_chunks % active_ranks;
+    if (base == 0) {
+        return (int)chunk_idx;
+    }
+
+    MPI_Offset split = (base + 1) * rem;
+    if (chunk_idx < split) {
+        return (int)(chunk_idx / (base + 1));
+    }
+    return (int)(rem + (chunk_idx - split) / base);
+}
+
+static int
+chunk_owner(MPI_Offset chunk_idx,
+            MPI_Offset total_chunks,
+            int        active_ranks)
+{
+    /* Keep app scheduling identical to ncchunkio owner map. */
+    return owner_for_contiguous_chunk(chunk_idx, active_ranks, total_chunks);
 }
 
 int main(int argc, char **argv)
@@ -65,8 +89,6 @@ int main(int argc, char **argv)
         const char *vers = ncmpi_inq_libvers();
         fprintf(stderr, "[DEBUG] PnetCDF libvers: %s\n", vers ? vers : "unknown");
     }
-
-    double total_start_time = MPI_Wtime();  /* Start timing the entire process */
 
     if (argc < 3) {
         if (rank == 0) {
@@ -101,7 +123,11 @@ int main(int argc, char **argv)
     CHECK_ERR(ncmpi_inq_dimlen(ncid_in, time_dimid_in, &time_len));
     CHECK_ERR(ncmpi_inq_dimlen(ncid_in, y_dimid_in, &y_len));
     CHECK_ERR(ncmpi_inq_dimlen(ncid_in, x_dimid_in, &x_len));
-    MPI_Offset chunk_count_t = (time_len + CHUNK_T - 1) / CHUNK_T;
+    MPI_Offset chunk_grid_t = (time_len + CHUNK_T - 1) / CHUNK_T;
+    MPI_Offset chunk_grid_y = (y_len + CHUNK_Y - 1) / CHUNK_Y;
+    MPI_Offset chunk_grid_x = (x_len + CHUNK_X - 1) / CHUNK_X;
+    MPI_Offset chunks_per_record = chunk_grid_y * chunk_grid_x;
+    MPI_Offset total_chunks = chunk_grid_t * chunks_per_record;
 
     int x_varid_in, y_varid_in, time_varid_in;
     int lat_varid_in, lon_varid_in, proj_varid_in;
@@ -135,6 +161,7 @@ int main(int argc, char **argv)
     MPI_Info info;
     MPI_Info_create(&info);
     MPI_Info_set(info, "nc_chunking", "enable");
+    MPI_Info_set(info, "nc_chk_cown_ratio", "0");         /* disable ownership load-balance penalty */
     /* hint MPI-IO that each chunk is large (~240 MB) so aggregators allocate enough buffer */
     MPI_Info_set(info, "cb_buffer_size", "536870912");    /* 512 MB */
     MPI_Info_set(info, "striping_unit", "536870912");     /* match cb buffer */
@@ -300,14 +327,12 @@ int main(int argc, char **argv)
         }
     }
 
-    /* Both files use independent mode for parallel processing.
-     * Each rank processes its own chunks concurrently.
+    /* End independent mode used for coordinate reads.
+     * FLDS chunk reads below are performed in independent mode per batch.
      */
-    CHECK_ERR(ncmpi_begin_indep_data(ncid_out));
+    CHECK_ERR(ncmpi_end_indep_data(ncid_in));
 
-    if (chunk_count_t == 0) {
-        CHECK_ERR(ncmpi_end_indep_data(ncid_in));
-        CHECK_ERR(ncmpi_end_indep_data(ncid_out));
+    if (total_chunks == 0) {
         CHECK_ERR(ncmpi_sync(ncid_out));
         CHECK_ERR(ncmpi_close(ncid_out));
         CHECK_ERR(ncmpi_close(ncid_in));
@@ -315,29 +340,28 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    int active_ranks = (int)((chunk_count_t < (MPI_Offset)nprocs) ? chunk_count_t : (MPI_Offset)nprocs);
+    int active_ranks = (int)((total_chunks < (MPI_Offset)nprocs) ?
+                             total_chunks : (MPI_Offset)nprocs);
     if (active_ranks == 0) active_ranks = 1;
 
-    int chunks_per_rank = (int)(chunk_count_t / active_ranks);
-    int remainder = (int)(chunk_count_t % active_ranks);
-
     if (rank == 0) {
-        printf("[DEBUG] nprocs=%d, chunk_count_t=%lld, active_ranks=%d\n",
-               nprocs, (long long)chunk_count_t, active_ranks);
-        printf("[DEBUG] chunks_per_rank=%d, remainder=%d\n",
-               chunks_per_rank, remainder);
+        printf("[DEBUG] nprocs=%d, total_chunks=%lld, active_ranks=%d\n",
+               nprocs, (long long)total_chunks, active_ranks);
+        printf("[DEBUG] chunk grid (t,y,x) = %lld x %lld x %lld\n",
+               (long long)chunk_grid_t, (long long)chunk_grid_y, (long long)chunk_grid_x);
+        printf("[DEBUG] chunk ownership: contiguous chunk-id blocks\n");
         fflush(stdout);
     }
 
     if (rank == 0 && active_ranks < nprocs) {
-        printf("Info: using %d out of %d ranks for %lld time chunks.\n",
-               active_ranks, nprocs, (long long)chunk_count_t);
+        printf("Info: using %d out of %d ranks for %lld total chunks.\n",
+               active_ranks, nprocs, (long long)total_chunks);
     }
 
     /* Count how many chunks this rank owns */
     int my_chunk_count = 0;
-    for (MPI_Offset chunk_idx = 0; chunk_idx < chunk_count_t; ++chunk_idx) {
-        int owner = chunk_owner(chunk_idx, active_ranks, chunks_per_rank, remainder);
+    for (MPI_Offset chunk_idx = 0; chunk_idx < total_chunks; ++chunk_idx) {
+        int owner = chunk_owner(chunk_idx, total_chunks, active_ranks);
         if (rank == owner) {
             my_chunk_count++;
         }
@@ -346,8 +370,8 @@ int main(int argc, char **argv)
     /* Print from all ranks to confirm parallel execution */
     printf("[Rank %d] my_chunk_count=%d (will process chunks: ", rank, my_chunk_count);
     int printed = 0;
-    for (MPI_Offset ci = 0; ci < chunk_count_t && printed < 5; ++ci) {
-        if (chunk_owner(ci, active_ranks, chunks_per_rank, remainder) == rank) {
+    for (MPI_Offset ci = 0; ci < total_chunks && printed < 5; ++ci) {
+        if (chunk_owner(ci, total_chunks, active_ranks) == rank) {
             printf("%lld ", (long long)ci);
             printed++;
         }
@@ -355,112 +379,168 @@ int main(int argc, char **argv)
     if (my_chunk_count > 5) printf("...");
     printf(")\n");
     fflush(stdout);
-    
-    /* Allocate one reusable buffer per rank */
-    float *chunk_buf = NULL;
-    size_t chunk_buf_elems = 0;
-    if (my_chunk_count > 0) {
-        MPI_Offset max_t = (time_len < (MPI_Offset)CHUNK_T) ? time_len : (MPI_Offset)CHUNK_T;
-        MPI_Offset max_elems = max_t * y_len * x_len;
-        if (max_elems <= 0 || (double)max_elems > (double)SIZE_MAX / sizeof(float)) {
-            fprintf(stderr, "[%d] Chunk buffer size exceeds size_t limit\n", rank);
-            MPI_Abort(MPI_COMM_WORLD, -1);
+
+    /* Compute per-chunk capacity (max elements in one chunk) */
+    MPI_Offset max_t = (time_len < (MPI_Offset)CHUNK_T) ? time_len : (MPI_Offset)CHUNK_T;
+    MPI_Offset max_y = (y_len < (MPI_Offset)CHUNK_Y) ? y_len : (MPI_Offset)CHUNK_Y;
+    MPI_Offset max_x = (x_len < (MPI_Offset)CHUNK_X) ? x_len : (MPI_Offset)CHUNK_X;
+    size_t chunk_buf_elems = (size_t)(max_t * max_y * max_x);
+
+    int batch_chunks = DEFAULT_BATCH_CHUNKS;
+    {
+        const char *env_batch = getenv("IPCOMP_BATCH_CHUNKS");
+        if (env_batch != NULL) {
+            int v = atoi(env_batch);
+            if (v > 0) batch_chunks = v;
         }
-        chunk_buf_elems = (size_t)max_elems;
-        chunk_buf = (float *)malloc(chunk_buf_elems * sizeof(float));
-        if (chunk_buf == NULL) {
-            fprintf(stderr, "[%d] Failed to allocate %.2f MB chunk buffer\n",
-                    rank, (double)chunk_buf_elems * sizeof(float) / (1024.0 * 1024.0));
+    }
+
+    /* Store metadata for all chunks owned by this rank */
+    MPI_Offset *all_starts = NULL;   /* my_chunk_count * 3 */
+    MPI_Offset *all_counts = NULL;   /* my_chunk_count * 3 */
+    MPI_Offset *all_elems  = NULL;   /* my_chunk_count */
+
+    if (my_chunk_count > 0) {
+        all_starts = (MPI_Offset *)malloc((size_t)my_chunk_count * 3 * sizeof(MPI_Offset));
+        all_counts = (MPI_Offset *)malloc((size_t)my_chunk_count * 3 * sizeof(MPI_Offset));
+        all_elems  = (MPI_Offset *)malloc((size_t)my_chunk_count * sizeof(MPI_Offset));
+        if (all_starts == NULL || all_counts == NULL || all_elems == NULL) {
+            fprintf(stderr, "[%d] Failed to allocate chunk metadata arrays\n", rank);
             MPI_Abort(MPI_COMM_WORLD, -1);
         }
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);  /* Sync before starting main loop */
+    /* Pre-compute chunk metadata for this rank's chunks */
+    {
+        int ci = 0;
+        MPI_Offset plane = chunks_per_record;
+        for (MPI_Offset chunk_idx = 0; chunk_idx < total_chunks; ++chunk_idx) {
+            if (chunk_owner(chunk_idx, total_chunks, active_ranks) != rank)
+                continue;
+            MPI_Offset ct = chunk_idx / plane;
+            MPI_Offset rem = chunk_idx % plane;
+            MPI_Offset cy = rem / chunk_grid_x;
+            MPI_Offset cx = rem % chunk_grid_x;
+
+            all_starts[ci * 3 + 0] = ct * CHUNK_T;
+            all_starts[ci * 3 + 1] = cy * CHUNK_Y;
+            all_starts[ci * 3 + 2] = cx * CHUNK_X;
+            all_counts[ci * 3 + 0] = CHUNK_T;
+            all_counts[ci * 3 + 1] = CHUNK_Y;
+            all_counts[ci * 3 + 2] = CHUNK_X;
+            if (all_starts[ci * 3] + all_counts[ci * 3] > time_len)
+                all_counts[ci * 3] = time_len - all_starts[ci * 3];
+            if (all_starts[ci * 3 + 1] + all_counts[ci * 3 + 1] > y_len)
+                all_counts[ci * 3 + 1] = y_len - all_starts[ci * 3 + 1];
+            if (all_starts[ci * 3 + 2] + all_counts[ci * 3 + 2] > x_len)
+                all_counts[ci * 3 + 2] = x_len - all_starts[ci * 3 + 2];
+            all_elems[ci] = all_counts[ci * 3 + 0]
+                          * all_counts[ci * 3 + 1]
+                          * all_counts[ci * 3 + 2];
+            ci++;
+        }
+    }
 
     if (rank == 0) {
-        printf("\n[DEBUG] Starting main loop: chunk_count_t=%lld\n",
-               (long long)chunk_count_t);
-        printf("[DEBUG] Each chunk is %.2f MB\n", 
-               (double)(y_len * x_len * sizeof(float)) / (1024.0 * 1024.0));
+        printf("\n[DEBUG] Starting main loop: total_chunks=%lld\n",
+               (long long)total_chunks);
+        printf("[DEBUG] Each chunk is %.2f MB\n",
+               (double)(chunk_buf_elems * sizeof(float)) / (1024.0 * 1024.0));
+        printf("[DEBUG] Batch size: %d chunks (env IPCOMP_BATCH_CHUNKS)\n", batch_chunks);
+        printf("[DEBUG] Per-rank batch buffer cap: %d chunks x %.2f MB = %.2f MB\n",
+               batch_chunks,
+               (double)chunk_buf_elems * sizeof(float) / (1024.0 * 1024.0),
+               (double)batch_chunks * chunk_buf_elems * sizeof(float) / (1024.0 * 1024.0));
         fflush(stdout);
     }
 
-    int total_processed = 0;
-    double start_time = MPI_Wtime();
     double local_min = DBL_MAX;
     double local_max = -DBL_MAX;
     long long local_valid = 0;
 
-    /* 
-     * Process chunks in PARALLEL using independent mode.
-     * Each rank processes only its own chunks concurrently.
-     * All ranks work simultaneously on different chunks.
+    /* Barrier before timing start */
+    MPI_Barrier(MPI_COMM_WORLD);
+    double t_read = 0.0;           /* sum of per-batch read time */
+    double t_write = 0.0;          /* sum of per-batch write+flush time */
+
+    /*
+     * Batch pipeline:
+     *   1) read a batch into temporary buffer
+     *   2) compute local min/max statistics
+     *   3) write batch and flush (end_indep_data) to bound memory
+     *   4) free batch buffer and continue
      */
-    for (MPI_Offset chunk_idx = 0; chunk_idx < chunk_count_t; ++chunk_idx) {
-        int owner = chunk_owner(chunk_idx, active_ranks, chunks_per_rank, remainder);
-        
-        /* Only owner processes this chunk */
-        if (rank != owner) {
-            continue;
-        }
+#ifdef ENABLE_IPCOMP
+    ipcomp_reset_core_timers();
+#endif
+    for (int batch_begin = 0; batch_begin < my_chunk_count; batch_begin += batch_chunks) {
+        int this_batch = my_chunk_count - batch_begin;
+        if (this_batch > batch_chunks) this_batch = batch_chunks;
 
-        MPI_Offset start[3] = { chunk_idx * CHUNK_T, 0, 0 };
-        MPI_Offset count[3] = { CHUNK_T, y_len, x_len };
-
-        if (start[0] + count[0] > time_len) {
-            count[0] = time_len - start[0];
-        }
-
-        MPI_Offset elems = count[0] * count[1] * count[2];
-        if (elems <= 0) {
-            continue;
-        }
-
-        if ((size_t)elems > SIZE_MAX / sizeof(float)) {
-            fprintf(stderr, "[%d] Chunk %lld exceeds size_t limit\n",
-                    rank, (long long)chunk_idx);
+        size_t batch_buf_bytes = (size_t)this_batch * chunk_buf_elems * sizeof(float);
+        float *batch_buf = (float *)malloc(batch_buf_bytes);
+        if (batch_buf == NULL) {
+            fprintf(stderr, "[%d] Failed to allocate %.2f MB batch buffer (batch=%d)\n",
+                    rank, (double)batch_buf_bytes / (1024.0 * 1024.0), this_batch);
             MPI_Abort(MPI_COMM_WORLD, -1);
         }
 
-        if (chunk_buf == NULL || (MPI_Offset)chunk_buf_elems < elems) {
-            fprintf(stderr, "[%d] Chunk buffer too small for chunk %lld\n",
-                    rank, (long long)chunk_idx);
-            MPI_Abort(MPI_COMM_WORLD, -1);
+        double t0 = MPI_Wtime();
+        CHECK_ERR(ncmpi_begin_indep_data(ncid_in));
+        for (int bi = 0; bi < this_batch; bi++) {
+            int i = batch_begin + bi;
+            MPI_Offset start[3] = { all_starts[i*3], all_starts[i*3+1], all_starts[i*3+2] };
+            MPI_Offset count[3] = { all_counts[i*3], all_counts[i*3+1], all_counts[i*3+2] };
+            float *buf = batch_buf + (size_t)bi * chunk_buf_elems;
+            CHECK_ERR(ncmpi_get_vara_float(ncid_in, flds_varid_in, start, count, buf));
         }
+        CHECK_ERR(ncmpi_end_indep_data(ncid_in));
+        t_read += MPI_Wtime() - t0;
 
-        /* Print progress */
-        printf("[Rank %d] Processing chunk %lld/%lld...\n",
-               rank, (long long)chunk_idx, (long long)(chunk_count_t - 1));
-        fflush(stdout);
-
-        /* Read chunk data (independent mode) */
-        CHECK_ERR(ncmpi_get_vara_float(ncid_in, flds_varid_in, start, count, chunk_buf));
-
-        /* Update local statistics ignoring _FillValue/NaN/Inf */
-        for (MPI_Offset i = 0; i < elems; i++) {
-            float val = chunk_buf[i];
-            if ((has_fill_value && val == fill_value) || isnan(val) || isinf(val)) {
-                continue;
+        for (int bi = 0; bi < this_batch; bi++) {
+            int i = batch_begin + bi;
+            float *buf = batch_buf + (size_t)bi * chunk_buf_elems;
+            for (MPI_Offset j = 0; j < all_elems[i]; j++) {
+                float val = buf[j];
+                if ((has_fill_value && val == fill_value) || isnan(val) || isinf(val))
+                    continue;
+                if (val < local_min) local_min = val;
+                if (val > local_max) local_max = val;
+                local_valid++;
             }
-            if (val < local_min) local_min = val;
-            if (val > local_max) local_max = val;
-            local_valid++;
         }
 
-        /* Write chunk data using independent mode (parallel) */
-        CHECK_ERR(ncmpi_put_vara_float(ncid_out, flds_varid_out, start, count, chunk_buf));
+        t0 = MPI_Wtime();
+        CHECK_ERR(ncmpi_begin_indep_data(ncid_out));
+        for (int bi = 0; bi < this_batch; bi++) {
+            int i = batch_begin + bi;
+            MPI_Offset start[3] = { all_starts[i*3], all_starts[i*3+1], all_starts[i*3+2] };
+            MPI_Offset count[3] = { all_counts[i*3], all_counts[i*3+1], all_counts[i*3+2] };
+            float *buf = batch_buf + (size_t)bi * chunk_buf_elems;
+            CHECK_ERR(ncmpi_put_vara_float(ncid_out, flds_varid_out, start, count, buf));
+        }
+        CHECK_ERR(ncmpi_end_indep_data(ncid_out)); /* flush this batch */
+        t_write += MPI_Wtime() - t0;
 
-        total_processed++;
-
-        printf("[Rank %d] Completed chunk %lld (my total: %d)\n", 
-               rank, (long long)chunk_idx, total_processed);
-        fflush(stdout);
+        free(batch_buf);
     }
 
-    if (chunk_buf != NULL) {
-        free(chunk_buf);
-        chunk_buf = NULL;
-    }
+#ifdef ENABLE_IPCOMP
+    double core_comp = ipcomp_get_core_compress_time();
+    unsigned long long core_comp_bytes = ipcomp_get_core_compress_bytes();
+#else
+    double core_comp = 0.0;
+    unsigned long long core_comp_bytes = 0ULL;
+#endif
+    /* write_io = pure I/O portion of write (compression subtracted) */
+    double write_io = t_write - core_comp;
+    if (write_io < 0.0) write_io = 0.0;
+    double read_io = t_read;
+    double t_total = t_read + t_write;
+
+    if (all_starts != NULL) free(all_starts);
+    if (all_counts != NULL) free(all_counts);
+    if (all_elems != NULL) free(all_elems);
 
     double global_min = 0.0;
     double global_max = 0.0;
@@ -493,17 +573,37 @@ int main(int argc, char **argv)
     MPI_Bcast(attr_values, 3, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(&valid_total, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
 
-    double end_time = MPI_Wtime();
-    printf("[Rank %d] Finished all %d chunks in %.2f seconds\n", 
-           rank, total_processed, end_time - start_time);
+    printf("[Rank %d] Finished %d chunks in %.2f seconds\n",
+           rank, my_chunk_count, t_total);
     fflush(stdout);
 
-    /* Barrier to ensure all ranks have finished their independent writes */
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    /* End independent mode for both files before closing */
-    CHECK_ERR(ncmpi_end_indep_data(ncid_in));
-    CHECK_ERR(ncmpi_end_indep_data(ncid_out));
+    double *rank_total = NULL;
+    double *rank_read = NULL;
+    double *rank_core = NULL;
+    double *rank_write = NULL;
+    long long *rank_valid_count = NULL;
+    unsigned long long *rank_core_bytes = NULL;
+    if (rank == 0) {
+        rank_total = (double *)malloc((size_t)nprocs * sizeof(double));
+        rank_read = (double *)malloc((size_t)nprocs * sizeof(double));
+        rank_core = (double *)malloc((size_t)nprocs * sizeof(double));
+        rank_write = (double *)malloc((size_t)nprocs * sizeof(double));
+        rank_valid_count = (long long *)malloc((size_t)nprocs * sizeof(long long));
+        rank_core_bytes = (unsigned long long *)malloc((size_t)nprocs * sizeof(unsigned long long));
+        if (rank_total == NULL || rank_read == NULL ||
+            rank_core == NULL || rank_write == NULL ||
+            rank_valid_count == NULL || rank_core_bytes == NULL) {
+            fprintf(stderr, "[%d] Failed to allocate timing buffers\n", rank);
+            MPI_Abort(MPI_COMM_WORLD, -1);
+        }
+    }
+    MPI_Gather(&t_total, 1, MPI_DOUBLE, rank_total, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Gather(&read_io, 1, MPI_DOUBLE, rank_read, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Gather(&core_comp, 1, MPI_DOUBLE, rank_core, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Gather(&write_io, 1, MPI_DOUBLE, rank_write, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Gather(&local_valid, 1, MPI_LONG_LONG, rank_valid_count, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+    MPI_Gather(&core_comp_bytes, 1, MPI_UNSIGNED_LONG_LONG,
+               rank_core_bytes, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
 
     /* Update compression metadata with actual data range */
     CHECK_ERR(ncmpi_redef(ncid_out));
@@ -532,25 +632,80 @@ int main(int argc, char **argv)
     CHECK_ERR(ncmpi_close(ncid_out));
     CHECK_ERR(ncmpi_close(ncid_in));
 
-    double total_end_time = MPI_Wtime();
-    double total_elapsed = total_end_time - total_start_time;
-
-    /* Gather timing from all ranks to report min/max/avg */
-    double max_time, min_time, sum_time;
-    MPI_Reduce(&total_elapsed, &max_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&total_elapsed, &min_time, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&total_elapsed, &sum_time, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-
     if (rank == 0) {
+        double total_min = rank_total[0], total_max = rank_total[0], total_sum = 0.0;
+        double read_min = rank_read[0], read_max = rank_read[0], read_sum = 0.0;
+        double core_min = rank_core[0], core_max = rank_core[0], core_sum = 0.0;
+        double write_min = rank_write[0], write_max = rank_write[0], write_sum = 0.0;
+        long long valid_min = rank_valid_count[0], valid_max = rank_valid_count[0];
+        long double valid_sum = 0.0L;
+        unsigned long long bytes_min = rank_core_bytes[0], bytes_max = rank_core_bytes[0];
+        long double bytes_sum = 0.0L;
+        for (int r = 0; r < nprocs; r++) {
+            double tv = rank_total[r];
+            double rv = rank_read[r];
+            double cv = rank_core[r];
+            double wv = rank_write[r];
+            long long vv = rank_valid_count[r];
+            unsigned long long bv = rank_core_bytes[r];
+            if (tv < total_min) total_min = tv;
+            if (tv > total_max) total_max = tv;
+            if (rv < read_min) read_min = rv;
+            if (rv > read_max) read_max = rv;
+            if (cv < core_min) core_min = cv;
+            if (cv > core_max) core_max = cv;
+            if (wv < write_min) write_min = wv;
+            if (wv > write_max) write_max = wv;
+            if (vv < valid_min) valid_min = vv;
+            if (vv > valid_max) valid_max = vv;
+            if (bv < bytes_min) bytes_min = bv;
+            if (bv > bytes_max) bytes_max = bv;
+            total_sum += tv;
+            read_sum += rv;
+            core_sum += cv;
+            write_sum += wv;
+            valid_sum += (long double)vv;
+            bytes_sum += (long double)bv;
+        }
         printf("\n========== SUMMARY ==========\n");
         printf("Compression complete: %s -> %s\n", input_path, output_path);
-        printf("Total chunks: %lld, Chunk size: %d x %d x %d\n",
-               (long long)chunk_count_t, CHUNK_T, CHUNK_Y, CHUNK_X);
+        printf("Total chunks: %lld, Chunk size (t,y,x): %d x %d x %d\n",
+               (long long)total_chunks, CHUNK_T, CHUNK_Y, CHUNK_X);
         printf("Processes: %d\n", nprocs);
-        printf("Total time: %.2f seconds (min: %.2f, max: %.2f, avg: %.2f)\n",
-               max_time, min_time, max_time, sum_time / nprocs);
+        printf("Per-rank breakdown (seconds):\n");
+        for (int r = 0; r < nprocs; r++) {
+            printf("  rank %d: total=%.6f read_io=%.6f core_comp=%.6f write_io=%.6f "
+                   "valid_count=%lld core_comp_bytes=%llu\n",
+                   r, rank_total[r], rank_read[r], rank_core[r], rank_write[r],
+                   rank_valid_count[r], rank_core_bytes[r]);
+        }
+        printf("Timing stats across ranks (seconds):\n");
+        printf("  total: min=%.6f max=%.6f avg=%.6f\n",
+               total_min, total_max, total_sum / (double)nprocs);
+        printf("  read_io: min=%.6f max=%.6f avg=%.6f\n",
+               read_min, read_max, read_sum / (double)nprocs);
+        printf("  core_comp: min=%.6f max=%.6f avg=%.6f\n",
+               core_min, core_max, core_sum / (double)nprocs);
+        printf("  write_io: min=%.6f max=%.6f avg=%.6f\n",
+               write_min, write_max, write_sum / (double)nprocs);
+        printf("Data/compression diagnostics across ranks:\n");
+        printf("  valid_count: min=%lld max=%lld avg=%.2Lf\n",
+               valid_min, valid_max, valid_sum / (long double)nprocs);
+        printf("  core_comp_bytes: min=%llu max=%llu avg=%.2Lf\n",
+               bytes_min, bytes_max, bytes_sum / (long double)nprocs);
+        printf("  core_comp_bytes(MiB): min=%.2f max=%.2f avg=%.2f\n",
+               (double)bytes_min / (1024.0 * 1024.0),
+               (double)bytes_max / (1024.0 * 1024.0),
+               (double)(bytes_sum / (long double)nprocs) / (1024.0 * 1024.0));
         printf("=============================\n");
     }
+
+    if (rank_total != NULL) free(rank_total);
+    if (rank_read != NULL) free(rank_read);
+    if (rank_core != NULL) free(rank_core);
+    if (rank_write != NULL) free(rank_write);
+    if (rank_valid_count != NULL) free(rank_valid_count);
+    if (rank_core_bytes != NULL) free(rank_core_bytes);
 
     MPI_Finalize();
     return 0;

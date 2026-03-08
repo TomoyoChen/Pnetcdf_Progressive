@@ -143,6 +143,32 @@ static size_t ipcomp_total_elems(int ndim, const int *dims)
     return total;
 }
 
+/* Apply mask to IPComp only for true sparse chunks with matching shape.
+ * This avoids mask/data desync on mixed-size chunks and all-fill chunks. */
+static int ipcomp_should_apply_mask(const NCCHK_var_context *ctx,
+                                    int ndim,
+                                    const int *dims)
+{
+    if (ctx == NULL || dims == NULL) return 0;
+    if (!ctx->ipcomp_mask_ready || ctx->ipcomp_mask_bits == NULL) return 0;
+
+    size_t total_elems = ipcomp_total_elems(ndim, dims);
+    if (total_elems == 0) return 0;
+
+    /* valid_count==0 means all-fill chunk; no need to drive mask logic in IPComp. */
+    if (ctx->ipcomp_mask_valid_count == 0 ||
+        ctx->ipcomp_mask_valid_count >= total_elems) {
+        return 0;
+    }
+
+    size_t expected_mask_bytes = (total_elems + 7u) >> 3;
+    if (ctx->ipcomp_mask_bytes != expected_mask_bytes) {
+        return 0;
+    }
+
+    return 1;
+}
+
 static int ipcomp_is_valid_value(double val, double fill_value, int has_fill)
 {
     if (isnan(val) || isinf(val)) return 0;
@@ -158,6 +184,26 @@ static void ipcomp_mask_set(unsigned char *mask, size_t idx)
 static int ipcomp_mask_test(const unsigned char *mask, size_t idx)
 {
     return (mask[idx >> 3] >> (idx & 7)) & 0x1;
+}
+
+static void ipcomp_zero_invalid_positions(void *chunk,
+                                          size_t total_elems,
+                                          MPI_Datatype dtype,
+                                          const unsigned char *mask)
+{
+    if (chunk == NULL || mask == NULL) return;
+
+    if (dtype == MPI_FLOAT) {
+        float *vals = (float *)chunk;
+        for (size_t i = 0; i < total_elems; i++) {
+            if (!ipcomp_mask_test(mask, i)) vals[i] = 0.0f;
+        }
+    } else if (dtype == MPI_DOUBLE) {
+        double *vals = (double *)chunk;
+        for (size_t i = 0; i < total_elems; i++) {
+            if (!ipcomp_mask_test(mask, i)) vals[i] = 0.0;
+        }
+    }
 }
 
 static uint32_t ipcomp_crc32_like(const unsigned char *buf, size_t len)
@@ -488,22 +534,19 @@ static int ipcomp_prepare_full_chunk(const void *in, int ndim, const int *dims,
         hdr->flags |= IPCOMP_SPARSE_FLAG_HAS_MINMAX;
     }
 
-    /* Decide whether to build or reuse cached mask */
+    /* Build mask for THIS chunk.
+     * Reusing a cached mask across chunks is unsafe when edge chunks have
+     * different dimensions (e.g., non-divisible chunking in Y/X), and even
+     * for same-sized chunks the valid mask can differ by spatial location. */
     unsigned char *mask = NULL;
     unsigned char *boundary = NULL;
     size_t mask_bytes = 0;
     uint64_t valid_count = 0;
     uint32_t mask_crc = 0;
     int has_fill = (ctx != NULL) ? ctx->ipcomp_has_fill : 1;
-    int use_cached = (ctx && ctx->ipcomp_mask_ready);
+    int use_cached = 0; /* do not reuse across chunks */
 
-    if (use_cached) {
-        mask = ctx->ipcomp_mask_bits;
-        boundary = ctx->ipcomp_boundary_bits;
-        mask_bytes = ctx->ipcomp_mask_bytes;
-        valid_count = ctx->ipcomp_mask_valid_count;
-        mask_crc = ctx->ipcomp_mask_crc32;
-    } else {
+    {
         int err = ipcomp_build_masks(in, ndim, dims, dtype, fill_value, has_fill,
                                      guard_radius, &mask, &boundary,
                                      &mask_bytes, &valid_count, &mask_crc);
@@ -511,6 +554,12 @@ static int ipcomp_prepare_full_chunk(const void *in, int ndim, const int *dims,
             return err;
         }
         if (ctx) {
+            if (ctx->ipcomp_mask_bits && ctx->ipcomp_mask_bits != mask) {
+                free(ctx->ipcomp_mask_bits);
+            }
+            if (ctx->ipcomp_boundary_bits && ctx->ipcomp_boundary_bits != boundary) {
+                free(ctx->ipcomp_boundary_bits);
+            }
             ctx->ipcomp_mask_bits = mask;
             ctx->ipcomp_boundary_bits = boundary;
             ctx->ipcomp_mask_bytes = mask_bytes;
@@ -518,39 +567,12 @@ static int ipcomp_prepare_full_chunk(const void *in, int ndim, const int *dims,
             ctx->ipcomp_mask_crc32 = mask_crc;
             ctx->ipcomp_guard_radius = guard_radius;
             ctx->ipcomp_mask_ready = 1;
-            if (ctx->ipcomp_mask_shared == 0) {
-                ctx->ipcomp_mask_shared = 1;
-            }
+            ctx->ipcomp_mask_shared = 0;
         }
     }
 
     size_t chunk_bytes = total_elems * elem_size;
-    void *chunk = malloc(chunk_bytes);
-    if (chunk == NULL) {
-        if (!use_cached) {
-            free(mask);
-            free(boundary);
-        }
-        return NC_ENOMEM;
-    }
-    memcpy(chunk, in, chunk_bytes);
-
-    /* Zero-out invalid points using mask */
-    if (dtype == MPI_FLOAT) {
-        float *dst = (float *)chunk;
-        for (size_t idx = 0; idx < total_elems; idx++) {
-            if (!ipcomp_mask_test(mask, idx)) {
-                dst[idx] = 0.0f;
-            }
-        }
-    } else {
-        double *dst = (double *)chunk;
-        for (size_t idx = 0; idx < total_elems; idx++) {
-            if (!ipcomp_mask_test(mask, idx)) {
-                dst[idx] = 0.0;
-            }
-        }
-    }
+    void *chunk = NULL;
 
     /* NOTE:
      * Mask sidecar attributes are not reliably present at read time (see toy debug),
@@ -561,11 +583,12 @@ static int ipcomp_prepare_full_chunk(const void *in, int ndim, const int *dims,
      * metadata (redef) phase, we can re-enable IPCOMP_SPARSE_FLAG_MASK_EXT. */
     int embed_mask = 1;
     int wrote_attrs = 0;
+    (void)wrote_attrs;
 
     hdr->valid_count = valid_count;
     hdr->mask_bytes = embed_mask ? (uint64_t)mask_bytes : 0;
-    hdr->dense_elems = (uint64_t)total_elems;
-    hdr->dense_ndims = (uint32_t)ndim;
+    hdr->dense_elems = 0;
+    hdr->dense_ndims = 0;
     hdr->reserved = mask_crc;
     for (int i = 0; i < IPCOMP_SPARSE_MAX_NDIM; i++) {
         if (i < ndim) {
@@ -574,16 +597,40 @@ static int ipcomp_prepare_full_chunk(const void *in, int ndim, const int *dims,
             hdr->dense_dims[i] = 1;
         }
     }
-    hdr->flags |= IPCOMP_SPARSE_FLAG_HAS_DENSE;
-    hdr->flags |= IPCOMP_SPARSE_FLAG_FULL_CHUNK;
+
     if (valid_count < total_elems) {
         hdr->flags |= IPCOMP_SPARSE_FLAG_HAS_MASK;
+    }
+
+    /* All-invalid chunk: skip dense compression entirely. */
+    if (valid_count > 0) {
+        chunk = malloc(chunk_bytes);
+        if (chunk == NULL) {
+            if (!(ctx && mask == ctx->ipcomp_mask_bits)) free(mask);
+            if (!(ctx && boundary == ctx->ipcomp_boundary_bits)) free(boundary);
+            return NC_ENOMEM;
+        }
+        memcpy(chunk, in, chunk_bytes);
+
+        /* IMPORTANT: IPComp's masked path still expects invalid samples in the
+         * compression working buffer to be finite placeholders. In particular,
+         * an invalid root/anchor point must already be sanitized or the stream
+         * layout can become unstable. Zero only the temporary working copy;
+         * invalid positions are restored to fill value from the mask on decode. */
+        if (valid_count < total_elems && mask != NULL) {
+            ipcomp_zero_invalid_positions(chunk, total_elems, dtype, mask);
+        }
+
+        hdr->dense_elems = (uint64_t)total_elems;
+        hdr->dense_ndims = (uint32_t)ndim;
+        hdr->flags |= IPCOMP_SPARSE_FLAG_HAS_DENSE;
+        hdr->flags |= IPCOMP_SPARSE_FLAG_FULL_CHUNK;
     }
 
     *mask_out = embed_mask ? mask : NULL;
     *mask_bytes_out = embed_mask ? mask_bytes : 0;
     *chunk_out = chunk;
-    *chunk_bytes_out = chunk_bytes;
+    *chunk_bytes_out = (chunk != NULL) ? chunk_bytes : 0;
     return NC_NOERR;
 }
 
@@ -778,7 +825,7 @@ static int ipcomp_compress_sparse_payload(const void *in, int ndim, const int *d
         if (ctx != NULL && ctx->ipcomp_has_minmax) {
             ipcomp_set_minmax(compressor, ctx->ipcomp_data_min, ctx->ipcomp_data_max);
         }
-        if (ctx != NULL && ctx->ipcomp_mask_ready && ctx->ipcomp_mask_bits) {
+        if (ipcomp_should_apply_mask(ctx, dense_dims, dense_shape)) {
             ipcomp_set_mask(compressor,
                             ctx->ipcomp_mask_bits,
                             ctx->ipcomp_boundary_bits,
@@ -835,9 +882,7 @@ static int ipcomp_compress_sparse_payload(const void *in, int ndim, const int *d
         ipcomp_free_buffer(compressed_data);
         ipcomp_destroy_compressor(compressor);
     }
-    if (!(ctx && mask == ctx->ipcomp_mask_bits)) {
-        free(mask);
-    }
+    if (!(ctx && mask == ctx->ipcomp_mask_bits)) free(mask);
     free(prepared_chunk);
 
     *payload = buf;
@@ -945,7 +990,7 @@ static int ipcomp_decode_dense_payload(const ipcomp_sparse_header *hdr,
     if (ctx != NULL && ctx->ipcomp_has_minmax) {
         ipcomp_set_minmax(compressor, ctx->ipcomp_data_min, ctx->ipcomp_data_max);
     }
-    if (ctx != NULL && ctx->ipcomp_mask_ready && ctx->ipcomp_mask_bits) {
+    if (ipcomp_should_apply_mask(ctx, dense_dims, dense_shape)) {
         ipcomp_set_mask(compressor,
                         ctx->ipcomp_mask_bits,
                         ctx->ipcomp_boundary_bits,
@@ -985,6 +1030,7 @@ static int ipcomp_decompress_sparse_payload(const unsigned char *payload,
     int err = ipcomp_sparse_payload_unpack(payload, payload_len, &hdr,
                                            &mask, &dense_payload, &dense_payload_size);
     if (err != NC_NOERR) return err;
+    int inline_mask_bound = 0;
 
     /* Debug header summary */
     fprintf(stderr, "[IPCOMP][decomp] hdr ndims=%u dims=[%llu,%llu,%llu] flags=0x%x mask_bytes=%llu valid=%llu crc=%u guard(ctx)=%d\n",
@@ -998,9 +1044,19 @@ static int ipcomp_decompress_sparse_payload(const unsigned char *payload,
             hdr.reserved,
             ctx ? ctx->ipcomp_guard_radius : -1);
 
-    /* If mask is external, try to use cached copy */
+    /* Bind per-chunk mask state. Reusing previous chunk's mask is unsafe. */
     if ((hdr.flags & IPCOMP_SPARSE_FLAG_HAS_MASK) &&
-        !mask && ctx && ctx->ipcomp_get_att) {
+        !(hdr.flags & IPCOMP_SPARSE_FLAG_MASK_EXT) &&
+        mask && ctx && hdr.mask_bytes > 0) {
+        ctx->ipcomp_mask_bits = (unsigned char *)mask; /* payload-backed, non-owning */
+        ctx->ipcomp_mask_bytes = hdr.mask_bytes;
+        ctx->ipcomp_mask_crc32 = hdr.reserved;
+        ctx->ipcomp_mask_valid_count = hdr.valid_count;
+        if (ctx->ipcomp_guard_radius == 0) ctx->ipcomp_guard_radius = 2;
+        ctx->ipcomp_mask_ready = 1;
+        inline_mask_bound = 1;
+    } else if ((hdr.flags & IPCOMP_SPARSE_FLAG_HAS_MASK) &&
+               !mask && ctx && ctx->ipcomp_get_att) {
         unsigned char *mdata = NULL;
         size_t mbytes = 0;
         uint32_t mcrc = 0;
@@ -1017,18 +1073,12 @@ static int ipcomp_decompress_sparse_payload(const unsigned char *payload,
             ctx->ipcomp_guard_radius = guard_attr > 0 ? guard_attr : ctx->ipcomp_guard_radius;
             ctx->ipcomp_mask_ready = 1;
         }
-    } else if ((hdr.flags & IPCOMP_SPARSE_FLAG_HAS_MASK) &&
-               mask && ctx && !ctx->ipcomp_mask_ready && hdr.mask_bytes > 0) {
-        /* Cache inline mask for later chunks */
-        ctx->ipcomp_mask_bits = (unsigned char *)malloc(hdr.mask_bytes);
-        if (ctx->ipcomp_mask_bits) {
-            memcpy(ctx->ipcomp_mask_bits, mask, hdr.mask_bytes);
-            ctx->ipcomp_mask_bytes = hdr.mask_bytes;
-            ctx->ipcomp_mask_crc32 = hdr.reserved;
-            ctx->ipcomp_mask_valid_count = hdr.valid_count;
-            if (ctx->ipcomp_guard_radius == 0) ctx->ipcomp_guard_radius = 2;
-            ctx->ipcomp_mask_ready = 1;
-        }
+    } else if (ctx) {
+        /* No usable mask on this chunk: clear stale state. */
+        ctx->ipcomp_mask_bits = NULL;
+        ctx->ipcomp_mask_bytes = 0;
+        ctx->ipcomp_mask_valid_count = 0;
+        ctx->ipcomp_mask_ready = 0;
     }
     /* Debug: verify mask crc if available */
     if (ctx && ctx->ipcomp_mask_ready && ctx->ipcomp_mask_bits && ctx->ipcomp_mask_bytes > 0) {
@@ -1041,20 +1091,26 @@ static int ipcomp_decompress_sparse_payload(const unsigned char *payload,
                     crc_now, ctx->ipcomp_mask_bytes, (unsigned long long)ctx->ipcomp_mask_valid_count);
         }
     }
-    /* Build boundary mask if cache exists but boundary is missing */
-    if (ctx && ctx->ipcomp_mask_ready && ctx->ipcomp_boundary_bits == NULL &&
-        ctx->ipcomp_mask_bytes > 0) {
+    /* Rebuild boundary mask for THIS chunk. */
+    if (ctx && ctx->ipcomp_boundary_bits != NULL) {
+        free(ctx->ipcomp_boundary_bits);
+        ctx->ipcomp_boundary_bits = NULL;
+    }
+    if (ctx && ctx->ipcomp_mask_ready && ctx->ipcomp_mask_bits && ctx->ipcomp_mask_bytes > 0) {
         int guard_r = (ctx->ipcomp_guard_radius > 0) ? ctx->ipcomp_guard_radius : 2;
         int adims[IPCOMP_SPARSE_MAX_NDIM] = {1,1,1};
         int nd = (hdr.ndims > IPCOMP_SPARSE_MAX_NDIM) ? IPCOMP_SPARSE_MAX_NDIM : (int)hdr.ndims;
+        unsigned char *boundary = NULL;
         for (int i = 0; i < nd; i++) {
             adims[i] = (int)hdr.dims[i];
         }
         if (ipcomp_build_boundary_from_mask(ctx->ipcomp_mask_bits, nd, adims,
                                             guard_r, ctx->ipcomp_mask_bytes,
-                                            &ctx->ipcomp_boundary_bits) != NC_NOERR) {
+                                            &boundary) != NC_NOERR) {
             /* keep going without boundary mask */
             ctx->ipcomp_boundary_bits = NULL;
+        } else {
+            ctx->ipcomp_boundary_bits = boundary;
         }
     }
 
@@ -1068,6 +1124,16 @@ static int ipcomp_decompress_sparse_payload(const unsigned char *payload,
     err = ipcomp_scatter_sparse_chunk(&hdr, mask, dense, dtype, ctx, out_buf);
     if (dense != NULL) {
         ipcomp_free_buffer(dense);
+    }
+    if (inline_mask_bound && ctx) {
+        if (ctx->ipcomp_boundary_bits != NULL) {
+            free(ctx->ipcomp_boundary_bits);
+            ctx->ipcomp_boundary_bits = NULL;
+        }
+        ctx->ipcomp_mask_bits = NULL;
+        ctx->ipcomp_mask_bytes = 0;
+        ctx->ipcomp_mask_valid_count = 0;
+        ctx->ipcomp_mask_ready = 0;
     }
     return err;
 }
@@ -1348,13 +1414,15 @@ int ncchk_ipcomp_decompress_progressive_error(void *in, int in_len, void *out, i
         goto cleanup;
     }
 
-    /* Ensure mask/boundary are available for decoder to stay in sync.
-     * Without setting ctx->ipcomp_mask_*, ipcomp_decode_dense_payload() will not
-     * call ipcomp_set_mask(), and the progressive stream can desynchronize badly. */
+    /* Cache mask data from the sparse header for fill-value restoration
+     * after decompression (ipcomp_scatter_sparse_chunk needs it).
+     * NOTE: ipcomp_set_mask() is NOT called on the compressor object;
+     * IPComp runs with mask_enabled=false to avoid quant_ind desync. */
     unsigned char *owned_mask = NULL;
     unsigned char *owned_boundary = NULL;
     int free_owned_mask = 0;
     int free_owned_boundary = 0;
+    int inline_mask_bound = 0;
     if ((hdr.flags & IPCOMP_SPARSE_FLAG_HAS_MASK) && ctx != NULL) {
         /* Case 1: embedded mask in payload */
         if (!(hdr.flags & IPCOMP_SPARSE_FLAG_MASK_EXT) && mask != NULL && hdr.mask_bytes > 0) {
@@ -1364,6 +1432,7 @@ int ncchk_ipcomp_decompress_progressive_error(void *in, int in_len, void *out, i
             ctx->ipcomp_mask_valid_count = hdr.valid_count;
             if (ctx->ipcomp_guard_radius == 0) ctx->ipcomp_guard_radius = 2;
             ctx->ipcomp_mask_ready = 1;
+            inline_mask_bound = 1;
         }
         /* Case 2: external mask via attributes */
         else if ((hdr.flags & IPCOMP_SPARSE_FLAG_MASK_EXT) && ctx->ipcomp_get_att != NULL) {
@@ -1385,9 +1454,13 @@ int ncchk_ipcomp_decompress_progressive_error(void *in, int in_len, void *out, i
             }
         }
 
-        /* Boundary mask is not stored in payload; build it if we have a valid mask. */
+        /* Boundary mask is not stored in payload; rebuild per chunk. */
+        if (ctx->ipcomp_boundary_bits != NULL) {
+            free(ctx->ipcomp_boundary_bits);
+            ctx->ipcomp_boundary_bits = NULL;
+        }
         if (ctx->ipcomp_mask_ready && ctx->ipcomp_mask_bits != NULL &&
-            ctx->ipcomp_boundary_bits == NULL && ctx->ipcomp_mask_bytes > 0) {
+            ctx->ipcomp_mask_bytes > 0) {
             int guard_r = (ctx->ipcomp_guard_radius > 0) ? ctx->ipcomp_guard_radius : 2;
             int adims[IPCOMP_SPARSE_MAX_NDIM] = {1, 1, 1};
             int nd = (hdr.ndims > IPCOMP_SPARSE_MAX_NDIM) ? IPCOMP_SPARSE_MAX_NDIM : (int)hdr.ndims;
@@ -1426,6 +1499,12 @@ cleanup_dense:
     if (free_owned_boundary && owned_boundary != NULL) {
         free(owned_boundary);
         if (ctx) ctx->ipcomp_boundary_bits = NULL;
+    }
+    if (inline_mask_bound && ctx) {
+        ctx->ipcomp_mask_bits = NULL;
+        ctx->ipcomp_mask_bytes = 0;
+        ctx->ipcomp_mask_valid_count = 0;
+        ctx->ipcomp_mask_ready = 0;
     }
     if (free_owned_mask && owned_mask != NULL) {
         free(owned_mask);
@@ -1562,6 +1641,7 @@ int ncchk_ipcomp_decompress_progressive_bitrate(void *in, int in_len, void *out,
     unsigned char *owned_boundary = NULL;
     int free_owned_mask = 0;
     int free_owned_boundary = 0;
+    int inline_mask_bound = 0;
     if ((hdr.flags & IPCOMP_SPARSE_FLAG_HAS_MASK) && ctx != NULL) {
         if (!(hdr.flags & IPCOMP_SPARSE_FLAG_MASK_EXT) && mask != NULL && hdr.mask_bytes > 0) {
             ctx->ipcomp_mask_bits = (unsigned char *)mask;
@@ -1570,6 +1650,7 @@ int ncchk_ipcomp_decompress_progressive_bitrate(void *in, int in_len, void *out,
             ctx->ipcomp_mask_valid_count = hdr.valid_count;
             if (ctx->ipcomp_guard_radius == 0) ctx->ipcomp_guard_radius = 2;
             ctx->ipcomp_mask_ready = 1;
+            inline_mask_bound = 1;
         } else if ((hdr.flags & IPCOMP_SPARSE_FLAG_MASK_EXT) && ctx->ipcomp_get_att != NULL) {
             size_t mbytes = 0;
             uint32_t mcrc = 0;
@@ -1588,8 +1669,12 @@ int ncchk_ipcomp_decompress_progressive_bitrate(void *in, int in_len, void *out,
                 ctx->ipcomp_mask_ready = 1;
             }
         }
+        if (ctx->ipcomp_boundary_bits != NULL) {
+            free(ctx->ipcomp_boundary_bits);
+            ctx->ipcomp_boundary_bits = NULL;
+        }
         if (ctx->ipcomp_mask_ready && ctx->ipcomp_mask_bits != NULL &&
-            ctx->ipcomp_boundary_bits == NULL && ctx->ipcomp_mask_bytes > 0) {
+            ctx->ipcomp_mask_bytes > 0) {
             int guard_r = (ctx->ipcomp_guard_radius > 0) ? ctx->ipcomp_guard_radius : 2;
             int adims[IPCOMP_SPARSE_MAX_NDIM] = {1, 1, 1};
             int nd = (hdr.ndims > IPCOMP_SPARSE_MAX_NDIM) ? IPCOMP_SPARSE_MAX_NDIM : (int)hdr.ndims;
@@ -1638,6 +1723,12 @@ int ncchk_ipcomp_decompress_progressive_bitrate(void *in, int in_len, void *out,
     if (free_owned_boundary && owned_boundary != NULL) {
         free(owned_boundary);
         if (ctx) ctx->ipcomp_boundary_bits = NULL;
+    }
+    if (inline_mask_bound && ctx) {
+        ctx->ipcomp_mask_bits = NULL;
+        ctx->ipcomp_mask_bytes = 0;
+        ctx->ipcomp_mask_valid_count = 0;
+        ctx->ipcomp_mask_ready = 0;
     }
     if (free_owned_mask && owned_mask != NULL) {
         free(owned_mask);

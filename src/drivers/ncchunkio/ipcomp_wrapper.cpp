@@ -68,6 +68,7 @@ static inline void ipcomp_wrapper_dbg(const char* fmt, ...) {
 
 static double g_ipcomp_core_compress_time = 0.0;
 static double g_ipcomp_core_decompress_time = 0.0;
+static unsigned long long g_ipcomp_core_compress_bytes = 0ULL;
 
 /* IPComp wrapper structure */
 struct IPCompWrapper {
@@ -375,9 +376,14 @@ double ipcomp_get_core_decompress_time(void) {
     return g_ipcomp_core_decompress_time;
 }
 
+unsigned long long ipcomp_get_core_compress_bytes(void) {
+    return g_ipcomp_core_compress_bytes;
+}
+
 void ipcomp_reset_core_timers(void) {
     g_ipcomp_core_compress_time = 0.0;
     g_ipcomp_core_decompress_time = 0.0;
+    g_ipcomp_core_compress_bytes = 0ULL;
 }
 #endif
 
@@ -937,6 +943,7 @@ unsigned char* ipcomp_compress(void* compressor, const void* data, int data_type
             // 释放工作区；若 result 指向库内存，我们不去释放（通常 compress 会复用来写入工作区）
             free(lossless_buffer);
             register_buffer(out, delete_with_free);
+            g_ipcomp_core_compress_bytes += (unsigned long long)payload_size;
             *compressed_size = total_size;
             return out;
 
@@ -1679,6 +1686,10 @@ int ipcomp_set_mask(void* compressor,
 #else /* !ENABLE_IPCOMP */
 
 /* Stub implementations when IPComp is disabled */
+unsigned long long ipcomp_get_core_compress_bytes(void) {
+    return 0ULL;
+}
+
 void* ipcomp_create_compressor(int ndim, const int* dims, int interp_op, int direction_op, 
                               int layers, size_t interp_dim_limit, size_t block_size, int level_progressive) {
     return nullptr;
